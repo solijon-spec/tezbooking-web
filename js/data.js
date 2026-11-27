@@ -426,8 +426,11 @@
   // Oxirgi qism: jo'nash shahri (tur) yoki 'H' (faqat mehmonxona — reyssiz)
   const tailOf = (q) => (q.noFlight ? 'H' : q.from);
   // Mehmonxona bo'yicha qidiruv (q.hotel) alohida kesh: umumiy natija bilan aralashmasin
+  // Shahar (kurort) — faqat o'z davlati natijasi uchun alohida kesh (js/cities.js)
+  const cityCountry = (id) => { const c = id && window.TB_CITIES ? window.TB_CITIES.byId(id) : null; return c ? c.country : ''; };
   const liveSig = (country, q, dateIso) => [country, dateIso, q.nights, q.adults, (q.childAges || []).join('.'), tailOf(q)].join('|')
-    + (q.hotel ? '|h:' + String(q.hotel).toLowerCase().replace(/\s+/g, ' ').trim() : '');
+    + (q.hotel ? '|h:' + String(q.hotel).toLowerCase().replace(/\s+/g, ' ').trim() : '')
+    + (q.city && cityCountry(q.city) === country ? '|c:' + q.city : '');
   const slug = (s) => String(s).toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, '');
   // Diqqat: nomi hash() emas — aks holda yuqoridagi hash() ni almashtirib, rnd() doim 0 qaytaradi (barcha demo takliflar yashirinadi)
   const hash36 = (s) => hash(String(s)).toString(36);
@@ -439,9 +442,15 @@
       localStorage.setItem(LIVE_KEY, JSON.stringify(list));
     } catch (e) { /* to'lgan */ }
   }
-  function setLive(country, q, dateIso, data) {
+  // merge: "Operatordan yana yuklash" — mavjud natijaga keyingi sahifalar qo'shiladi, operator holati (more/next) yangilanadi.
+  // data.partial: qo'shni kun (±3 kun so'rovidan, faqat eng arzonlari) — shu kun tanlanganda to'liq qayta so'raladi.
+  function setLive(country, q, dateIso, data, merge) {
     const sig = liveSig(country, q, dateIso);
-    const entry = { at: Date.now(), country, hotelIds: [], offers: {}, ops: data.operators || [] };
+    const old = merge && live[sig];
+    // srvAt — operatorlardan olingan vaqt (server javobidagi at): "HH:MM da yangilandi" va 5 daqiqalik yangilash shundan hisoblanadi
+    const entry = old || { at: Date.now(), srvAt: data.at || Date.now(), country, hotelIds: [], offers: {}, ops: data.operators || [], partial: !!data.partial };
+    // Qo'shilayotgan operator holati yangilanadi (yana yuklash: more/next; xato bergan operator qayta so'ralganda: status ham)
+    if (old) (data.operators || []).forEach(x => { const i = old.ops.findIndex(o => o.id === x.id); if (i >= 0) old.ops[i] = Object.assign({}, old.ops[i], x, { more: x.more, next: x.next }); });
     (data.offers || []).forEach(r => {
       if (!OP_BY_ID[r.opId] || !r.hotel || !(r.price > 0)) return;
       const hid = 'L' + hash36(country + '|' + slug(r.hotel) + '|' + slug(r.city));
@@ -450,7 +459,9 @@
       const list = entry.offers[hid] || (entry.offers[hid] = []);
       if (!list.length) entry.hotelIds.push(hid);
       // Kalit formati demo bilan bir xil: mehmonxona|operator|sana|tunlar|kattalar|bolalar|xonalar|jo'nash
-      const key = [hid, r.opId + '.' + (r.roomKey || hash36(r.room)) + '.' + (r.mealKey || r.meal), dateIso, q.nights, q.adults, (q.childAges || []).join('.'), 1, tailOf(q)].join('|');
+      // Tur dasturi va reys ham kalitda: operator saytidagidek bir xil xona/ovqat, lekin boshqa tur (GDS/charter, Promo, boshqa reys) —
+      // alohida paket (oldin eng arzoniga qo'shilib ketardi)
+      const key = [hid, r.opId + '.' + (r.roomKey || hash36(r.room)) + '.' + (r.mealKey || r.meal) + '.' + hash36((r.tour || '') + '/' + (r.dep == null ? '' : r.dep)), dateIso, q.nights, q.adults, (q.childAges || []).join('.'), 1, tailOf(q)].join('|');
       liveKeys.add(key);
       const prev = list.find(o => o.key === key);
       if (prev && prev.price <= r.price) return;
@@ -462,9 +473,12 @@
         dep: typeof r.dep === 'number' ? r.dep : null, depDate: r.depDate || null, fromCode: r.fromCode || '', toCode: r.toCode || '',
         ticket: r.ticket && r.ticket.price > 0 ? r.ticket : null,
         hotelPrice: r.hotelPrice > 0 ? Math.round(r.hotelPrice) : null,
-        packagePrice: r.packagePrice > 0 ? r.packagePrice : null };
+        packagePrice: r.packagePrice > 0 ? r.packagePrice : null,
+        // Operator narxi boshqa valyutada (EUR): price — operatorning o'zi o'girgan USD narxi
+        opPrice: r.opPrice > 0 ? r.opPrice : null, opCurrency: r.opCurrency || '' };
       if (prev) list[list.indexOf(prev)] = offer; else list.push(offer);
     });
+    if (old) old.at = Date.now();
     live[sig] = entry;
     goneVer++;
     saveLiveHotels();

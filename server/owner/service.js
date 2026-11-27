@@ -37,7 +37,13 @@ function validateSearchParameters(input, now = Date.now()) {
   const country = typeof input.country === 'string' ? input.country.trim().toLowerCase() : '';
   const date = typeof input.date === 'string' ? input.date : '';
   const adults = Number(input.adults);
-  const nights = Number(input.nights);
+  let nights = Number(input.nights);
+  // Qaytish sanasi (ixtiyoriy, sayt filtri bilan bir xil): berilsa — tunlar soni shundan (qaytish − uchish)
+  const returnDate = input.returnDate === undefined || input.returnDate === null || input.returnDate === '' ? null : String(input.returnDate);
+  if (returnDate !== null) {
+    if (!validDate(returnDate) || !validDate(date) || returnDate <= date) return null;
+    nights = Math.round((Date.parse(returnDate + 'T00:00:00Z') - Date.parse(date + 'T00:00:00Z')) / 86400000);
+  }
   const childrenAges = input.childrenAges === undefined ? [] : input.childrenAges;
   const today = new Date(now()).toISOString().slice(0, 10);
   if (!destination || destination.length > 120 || !Object.prototype.hasOwnProperty.call(COUNTRY_RU, country)
@@ -68,6 +74,7 @@ function validateSearchParameters(input, now = Date.now()) {
     country,
     date,
     nights,
+    ...(returnDate ? { returnDate } : {}),
     adults,
     childrenAges: childrenAges.slice(),
     budget,
@@ -542,7 +549,7 @@ function createOwnerService({ db, now = Date.now, emit = () => {} }) {
   }
 
   function completeExecution(id, offers = []) {
-    if (!Array.isArray(offers) || offers.length > 100) return { error: 'invalid_worker_result' };
+    if (!Array.isArray(offers) || offers.length > 1000) return { error: 'invalid_worker_result' };
     const context = executionContext(id);
     if (!context || context.execution.status !== 'running' || context.website.integrationStatus !== 'verified') {
       return { error: 'execution_not_authorized' };

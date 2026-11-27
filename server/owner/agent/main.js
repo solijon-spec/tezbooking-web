@@ -63,6 +63,8 @@ function createMainAgent({ service, workers, scheduler, llmParser, now = Date.no
       departureAirport: parameters.departureAirport || null,
       hotelName
     };
+    // Qaytish sanasi ("15-22 dekabr"): tunlar soni shundan hisoblangan, topshiriqda ham saqlanadi
+    if (typeof parameters.returnDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(parameters.returnDate)) normalized.returnDate = parameters.returnDate;
     return normalized;
   }
 

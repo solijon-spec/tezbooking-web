@@ -128,6 +128,39 @@ function parseDate(text) {
   return null;
 }
 
+// Uchish va qaytish sanasi (sayt filtridagidek): "15-22 dekabr", "15–22 декабря", "15.12.2026 - 22.12.2026",
+// "2026-12-15 dan 2026-12-22 gacha", "15.12 uchish, qaytish 22.12". Qaytish sanasi bo'lsa — tunlar soni undan.
+function parseTrip(text) {
+  const pad = n => String(n).padStart(2, '0');
+  const yearOf = (y) => (y ? Number(y) : Number(today().slice(0, 4)));
+  const iso = (d, m, y) => `${y}-${pad(m + 1)}-${pad(d)}`;
+  const future = (d, m, y) => { let r = iso(d, m, yearOf(y)); if (!y && r < today()) r = iso(d, m, yearOf(y) + 1); return r; };
+  const after = (a, b) => (b > a ? b : b.replace(/^\d{4}/, String(Number(b.slice(0, 4)) + 1)));
+  // "15-22 dekabr" — bir oy ichida oraliq
+  const range = text.match(/(?:^|[^\p{L}\p{N}])(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*[-.]?\s*([\p{L}]{3,})\.?(?:\s+(20\d{2}))?/u);
+  if (range && monthIndex(range[3]) >= 0 && +range[1] >= 1 && +range[1] <= 31 && +range[2] >= 1 && +range[2] <= 31) {
+    const m = monthIndex(range[3]);
+    const start = future(+range[1], m, range[4]);
+    let end = iso(+range[2], m, Number(start.slice(0, 4)));
+    if (end <= start) end = iso(+range[2], (m + 1) % 12, Number(start.slice(0, 4)) + (m === 11 ? 1 : 0));
+    return { date: start, returnDate: end };
+  }
+  // Ikkita aniq sana: ISO, 15.12.2026 yoki 15.12 (yilsiz — eng yaqin kelajak)
+  const found = [];
+  const re = /\b(20\d{2})-(\d{2})-(\d{2})\b|\b(\d{1,2})[./](\d{1,2})(?:[./](20\d{2}))?(?![\d./])/g;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m[1]) found.push(`${m[1]}-${m[2]}-${m[3]}`);
+    else if (+m[4] >= 1 && +m[4] <= 31 && +m[5] >= 1 && +m[5] <= 12) found.push(future(+m[4], +m[5] - 1, m[6]));
+  }
+  if (found.length >= 2) {
+    const ret = after(found[0], found[1]);
+    const days = Math.round((Date.parse(ret) - Date.parse(found[0])) / 86400000);
+    if (days >= 1 && days <= 30) return { date: found[0], returnDate: ret };
+  }
+  return null;
+}
+
 function parseChildren(text) {
   const ages = [];
   const explicitList = text.match(/(?:children|kids|child|bolalar|bola|дет(?:и|ей|и))\s*(?:ages?|aged?|yosh(?:lari)?|лет)\s*[:=]?\s*(\d{1,2}(?:\s*(?:,|and|&|ва|и)\s*\d{1,2})*)/i);
@@ -245,10 +278,15 @@ function parseNaturalLanguage(text) {
   const missing = [];
   if (!destination) missing.push('destination');
   if (!country) missing.push('country');
-  const date = parseDate(text);
+  const trip = parseTrip(text);
+  const date = trip ? trip.date : parseDate(text);
+  const returnDate = trip ? trip.returnDate : null;
+  // Qaytish sanasi bo'lsa — tunlar soni undan (sayt filtridagidek)
+  const nights = returnDate ? Math.round((Date.parse(returnDate) - Date.parse(date)) / 86400000)
+    : nightsMatch ? Number(nightsMatch[1]) : null;
   if (!date) missing.push('date');
   if (!adultsMatch) missing.push('adults');
-  if (!nightsMatch) missing.push('nights');
+  if (!nights) missing.push('nights');
   if (children.childCount > children.ages.length) missing.push('childrenAges');
 
   const parameters = {
@@ -256,7 +294,8 @@ function parseNaturalLanguage(text) {
     country,
     date,
     adults: adultsMatch ? Number(adultsMatch[1]) : null,
-    nights: nightsMatch ? Number(nightsMatch[1]) : null,
+    nights,
+    returnDate,
     childrenAges: children.ages,
     mealPlan,
     budget: Number.isFinite(budget) ? budget : null,

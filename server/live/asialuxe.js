@@ -18,6 +18,7 @@ const { createAuth, authError } = require('./auth');
 const { hotelMatcher } = require('./hotel-match');
 const { mealCode } = require('./samo');
 const { DESTINATIONS } = require('../../js/agent-parser.js');
+const { cityMatcher } = require('../../js/cities.js');
 
 const normName = (s) => ' ' + String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^\p{L}\p{N}]+/gu, ' ').trim() + ' ';
 // Kurort nomi ("Istanbul", "Antalyaga", "Стамбул") -> shu shaharni taniydigan nomlar ro'yxati
@@ -103,13 +104,17 @@ async function citiesFor(op, from, country, signal, fetchImpl, city) {
   if (!all.length) return { note: 'no_country', cities: [] };
   const charter = directions.filter(d => String(d.depute).toUpperCase() === from && String(d.country).toUpperCase() === country)
     .map(d => all.find(c => String(c.code).toUpperCase() === String(d.arrive).toUpperCase())).filter(Boolean);
-  // Topshiriqda kurort bo'lsa (Istanbul, Antalya, Dubay) — avval shu shahar, keyin charter yo'nalishlar
-  const aliases = city ? cityAliases(city) : [];
-  const wanted = aliases.length ? all.filter(c => { const n = normName(c.name); return aliases.some(a => n.includes(' ' + a)); }) : [];
-  const ordered = [...new Set(wanted.concat(charter, all))];
-  // Kurort berilgan bo'lsa — 2 ta shahar; berilmagan bo'lsa (saytda butun davlat) — 4 tagacha charter shahar (parallel),
-  // aks holda mavsumi yopiq birinchi shaharlar (qishda Antaliya, Bodrum) Istanbul kabi ochiq yo'nalishni to'sib qo'yadi
-  return { note: '', cities: ordered.slice(0, wanted.length ? MAX_CITIES : Math.max(MAX_CITIES, Math.min(4, charter.length))) };
+  // Shahar (kurort) tanlangan bo'lsa (sayt filtri yoki agent topshirig'i: Istanbul, Antalya, Dubay) — faqat shu shahar,
+  // boshqa shahar qo'shilmaydi (TezBooking filtri bilan bir xil). Asialuxe'da bunday shahar bo'lmasa — no_city.
+  if (city) {
+    const match = cityMatcher(city, country.toLowerCase());
+    const wanted = match ? all.filter(c => match(c.name) || match(c.code)) : [];
+    return wanted.length ? { note: '', cities: wanted.slice(0, MAX_CITIES) } : { note: 'no_city', cities: [] };
+  }
+  const ordered = [...new Set(charter.concat(all))];
+  // Butun davlat — 4 tagacha charter shahar (parallel), aks holda mavsumi yopiq birinchi shaharlar
+  // (qishda Antaliya, Bodrum) Istanbul kabi ochiq yo'nalishni to'sib qo'yadi
+  return { note: '', cities: ordered.slice(0, Math.max(MAX_CITIES, Math.min(4, charter.length))) };
 }
 
 // ---------- Natijalar ----------
@@ -164,13 +169,19 @@ async function cheapestFlight(op, body, signal, fetchImpl, deadline) {
 
 // Bitta shahar: javobda mehmonxonalar paydo bo'lguncha (reys yuklanayotganda "pending") qayta so'rash,
 // so'ng narxni eng arzon reys bilan qayta hisoblash. flightId berilsa — o'sha reys bilan (mehmonxona filtri uchun qayta so'rov).
-async function listCity(op, q, city, filter, signal, fetchImpl, deadline, preset) {
+// Javob sahifalab keladi (pagination: page, last_page, has_more; 2026-11-27: Istanbul 12 × 30 = 332 mehmonxona).
+// Oldin faqat 1-sahifaning 30 tasi olinardi. Endi sahifa 100 ta; keyingilari — "Operatordan yana yuklash" (q.page),
+// o'sha reys bilan (preset) — narx 1-sahifadagidek bir xil reysdan hisoblanadi.
+const PER_PAGE = 100;
+const presets = new Map();
+const PRESET_TTL = 30 * 60000;
+async function listCity(op, q, city, filter, signal, fetchImpl, deadline, preset, pageNo = 1) {
   const body = {
     depute: q.fromCode, loc_id: Number(city.location_id), arrive: String(city.code).toUpperCase(),
     begin_date: q.date, end_date: shiftIso(q.date, q.nights), date_mode: 'fixed',
     rooms: [{ adult: q.adults, child_age: (q.childAges || []).slice(0, 4) }],
     platform: 'b2b_uz', cabin: 'Y', transfer: 'gr', flight_trip: 'rt', insurance: 'yes',
-    wait_flights: true, page: 1, per_page: 30, sort: 'price_asc'
+    wait_flights: true, page: pageNo, per_page: PER_PAGE, sort: 'price_asc'
   };
   if (filter) body.filter = filter;
   if (preset && preset.flightOfferId) body.flight_offer_id = preset.flightOfferId;
@@ -215,9 +226,27 @@ async function search(op, q, { fetchImpl = safeFetch } = {}) {
     if (!cities.length) return { offers: [], note };
     const qq = Object.assign({}, q, { fromCode });
     const matchHotel = q.hotel ? hotelMatcher(q.hotel) : null;
+    const page = matchHotel ? 1 : Math.max(1, q.page || 1);
     const results = await Promise.all(cities.map(async city => {
       try {
+        // Reys (preset) shahar va so'rov bo'yicha eslab qolinadi: keyingi sahifalar o'sha reys bilan
+        const pkey = [op.id, fromCode, city.code, q.date, q.nights, q.adults, (q.childAges || []).join('.')].join('|');
+        if (page > 1) {
+          let preset = presets.get(pkey);
+          if (!preset || Date.now() - preset.at > PRESET_TTL) {
+            const first = await listCity(op, qq, city, null, signal, fetchImpl, deadline);
+            preset = { flight: first.__flight, at: Date.now() };
+            presets.set(pkey, preset);
+          }
+          const jp = await listCity(op, qq, city, null, signal, fetchImpl, deadline, preset.flight, page);
+          return { offers: parseHotels(op, jp, qq, city.name), more: !!(jp.pagination && jp.pagination.has_more) };
+        }
         let j = await listCity(op, qq, city, null, signal, fetchImpl, deadline);
+        if (!matchHotel) {
+          presets.set(pkey, { flight: j.__flight, at: Date.now() });
+          if (presets.size > 500) presets.delete(presets.keys().next().value);
+          return { offers: parseHotels(op, j, qq, city.name), more: !!(j.pagination && j.pagination.has_more) };
+        }
         if (matchHotel) {
           // Operator mehmonxona filtri mehmonxona kodini kutadi — kodlarni birinchi javobdagi ro'yxatdan (nom bo'yicha) olamiz
           const codes = ((j.filters && j.filters.hotel) || []).filter(h => h && h.code != null && matchHotel(h.name))
@@ -239,7 +268,8 @@ async function search(op, q, { fetchImpl = safeFetch } = {}) {
       if (failed.length === results.length) throw failed[0].error;     // hamma shahar xato — operator xatosi
       return { offers: [], note: results.every(r => r.noHotel) ? 'no_hotel' : 'empty' };
     }
-    return { offers, note: '' };
+    const more = results.some(r => r.more);
+    return { offers, note: '', more, next: more ? page + 1 : undefined, cityApplied: !!q.city };
   } finally { clearTimeout(timer); }
 }
 

@@ -15,6 +15,7 @@
 
 const { DESTINATIONS, countryCode } = require('../../js/agent-parser.js');
 const { hotelMatcher } = require('../live/hotel-match');
+const { findCity } = require('../../js/cities.js');
 const { hasCredentials } = require('../live/credentials');
 
 const SITE_TO_LIVE = {
@@ -26,7 +27,7 @@ const SITE_TO_LIVE = {
 };
 // Sekin kabinetlar: navbatdagi umumiy vaqt chegarasidan uzoqroq kutiladi
 const SLOW_TIMEOUT_MS = { pegas: 120000, asialuxe: 180000 };
-const MAX_OFFERS = 100;   // service.completeExecution chegarasi
+const MAX_OFFERS = 600;   // bitta operatordan (service.completeExecution chegarasi 1000)
 
 // Kurort nomi -> operator yozadigan shahar/hudud nomlari (so'z boshi bo'yicha). "Antalya" — butun Antaliya sohili.
 const ALANYA = ['alany', 'алань', 'avsallar', 'авсаллар', 'konakli', 'конаклы', 'okurcalar', 'окурджалар', 'incekum', 'инджекум',
@@ -107,10 +108,12 @@ function toAgentOffer(o, parameters, sourceUrl) {
 }
 
 // Topshiriq bo'yicha saralash: kurort, ovqatlanish, yulduz, byudjet; sotuvda yo'q / reysda joy yo'q — chiqarilmaydi
-function selectOffers(offers, parameters, { uzsRate, limit }) {
+function selectOffers(offers, parameters, { uzsRate, limit, cityApplied = false }) {
   let list = offers.filter(o => o && o.hotel && o.price > 0 && o.avail !== 'stop' && o.seats !== 'none');
   const soldOut = offers.length > 0 && list.length === 0;   // turlar bor, lekin joy yo'q (mehmonxona yoki reys)
-  const matchesPlace = destinationMatcher(parameters.destination, parameters.country);
+  // Operator shaharni o'zi filtrlagan bo'lsa (SAMO TOWNS, Pegas hudud, Asialuxe shahar) — nom bo'yicha qayta saralanmaydi:
+  // operator tumanni yozadi ("Султанахмет" — Istanbul), nom bo'yicha saralash ularni tashlab yuborardi
+  const matchesPlace = cityApplied ? null : destinationMatcher(parameters.destination, parameters.country);
   const before = list.length;
   if (matchesPlace) list = list.filter(matchesPlace);
   const placeFiltered = !!matchesPlace && before > 0 && list.length === 0;
@@ -141,7 +144,11 @@ function liveParams(parameters) {
   if ((parameters.childrenAges || []).length) params.children = parameters.childrenAges.join(',');
   if (parameters.hotelName) params.hotel = parameters.hotelName;    // operatorning o'zida mehmonxona filtri
   // Kurort nomi: ko'p shaharli operator (Asialuxe) avval shu shaharni qidiradi; butun davlat bo'lsa — uzatilmaydi
-  if (parameters.destination && countryCode(parameters.destination) !== parameters.country) params.city = parameters.destination;
+  // Ro'yxatdagi shahar bo'lsa — uning id'si (sayt filtri bilan bir xil kalit, kesh umumiy): operator o'z shahar filtri bilan qidiradi
+  if (parameters.destination && countryCode(parameters.destination) !== parameters.country) {
+    const known = findCity(parameters.destination, parameters.country);
+    params.city = known ? known.id : parameters.destination;
+  }
   return params;
 }
 
@@ -154,8 +161,8 @@ function workerError(code) {
  *   live: createLive() natijasi (searchOne kerak), service: Owner service, workers: worker registry
  *   maxOffers: bitta operatordan nechta eng arzon taklif (1..100), uzsRate: so'm byudjetini USD ga o'tkazish uchun
  */
-function registerLiveWorkers({ live, service, workers, maxOffers = 30, uzsRate = 0, now = Date.now }) {
-  const limit = Math.max(1, Math.min(MAX_OFFERS, Number(maxOffers) || 30));
+function registerLiveWorkers({ live, service, workers, maxOffers = 200, uzsRate = 0, now = Date.now }) {
+  const limit = Math.max(1, Math.min(MAX_OFFERS, Number(maxOffers) || 200));
   const liveOps = new Map((live.OPERATORS || []).map(op => [op.id, op]));
   const known = new Set(service.listWebsites().map(site => site.id));
   const registered = [];
@@ -184,7 +191,7 @@ function registerLiveWorkers({ live, service, workers, maxOffers = 30, uzsRate =
         reportAuth(siteId, liveId);
         if (context.signal.aborted) throw workerError('worker_aborted');
         if (result.status === 'error' || result.status === 'busy') throw workerError(result.error || 'upstream_unavailable');
-        const picked = selectOffers(result.offers || [], parameters, { uzsRate, limit });
+        const picked = selectOffers(result.offers || [], parameters, { uzsRate, limit, cityApplied: !!result.cityApplied });
         context.log(result.cached ? 'search_cached' : 'search_done', { recordCount: Math.min(1000, (result.offers || []).length), durationMs: now() - started });
         // Natija yo'qligi sababi jurnalda: no_country (operator bu davlatga sotmaydi), no_hotel (bu mehmonxona yo'q), empty, closed, ...
         if (!picked.offers.length) {

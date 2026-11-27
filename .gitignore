@@ -5,3 +5,5 @@ node_modules/
 data/
 # Hallmark dizayn vositasining ish fayllari (skrinshotlar, jurnal)
 .hallmark/
+# Muharrir (VS Code) shaxsiy sozlamalari
+.vscode/

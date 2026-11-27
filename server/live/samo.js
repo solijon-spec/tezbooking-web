@@ -20,8 +20,10 @@
 const { createSafeFetch } = require('./safe-http');
 const { createAuth, authError, mergeCookies, setCookiesOf } = require('./auth');
 const { hotelMatcher } = require('./hotel-match');
+const { cityMatcher } = require('../../js/cities.js');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36 TezBooking/1.0';
-const TIMEOUT = Number(process.env.LIVE_TIMEOUT_MS) || 25000;
+// Bitta operator qidiruvi (barcha sahifalari bilan). FS Travel'ning 1000 qatorli sahifasi sekin tarmoqda 25 s dan oshardi.
+const TIMEOUT = Number(process.env.LIVE_TIMEOUT_MS) || 40000;
 const safeFetch = createSafeFetch({ timeoutMs: TIMEOUT });
 
 // TezBooking davlat kodlari -> SAMO'dagi ruscha nomlar
@@ -39,6 +41,8 @@ const FROM_RU = {
 //   Prestige'da "Отели ОАЭ- dynamic (а/к ...)" — dinamik paket ham shu turdagi.
 const GDS_RE = /\bGDS\b|регуляр|regular|рег\.\s*рейс|динамич|\bdynamic\b/i;
 
+// SAMO valyuta kodlari (FlyKhiva, Easybooking sahifalaridagi CURRENCY ro'yxatidan, 2026-11-27)
+const CURRENCY_CODE = { 2: 'USD', 3: 'EUR', 5: 'UZS' };
 const ymd = (iso) => iso.replace(/-/g, '');
 const isoFromYmd = (s) => s.slice(0, 4) + '-' + s.slice(4, 6) + '-' + s.slice(6, 8);
 const norm = (s) => String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, ' ').trim();
@@ -191,16 +195,64 @@ async function states(op, townInc, signal) {
   return st;
 }
 // Davlatdagi mehmonxonalar ro'yxati (davlat tanlanganda sahifa oladigan "samo.hotelDynamic = [{"id":..,"name":..}]"), 6 soat keshda
-async function hotelsOf(op, townInc, stateInc, signal) {
-  const k = op.id + '|' + townInc + '|' + stateInc + '|hotels', c = metaCache.get(k);
-  if (c && Date.now() - c.at < 6 * 3600000) return c.hotels;
-  const js = await samo(op, 'samo_action=STATEINC&TOWNFROMINC=' + townInc + '&STATEINC=' + stateInc, signal);
-  const hotels = [];
-  for (const m of js.matchAll(/\{"id":(\d+),"name":"((?:[^"\\]|\\.)*)"/g)) {
-    try { hotels.push({ id: m[1], name: JSON.parse('"' + m[2] + '"') }); } catch (e) { /* buzilgan nom — o'tkazib yuboriladi */ }
+// Shu so'rovning o'zida kurort shaharlar ham keladi (TOWNS): guruh (shahar, masalan "Стамбул", "Дубай") va uning ichidagi
+// tumanlar kodlari (<label class="groupname">Дубай</label> ... <input type="checkbox" value="1354"/> Шарджа). 2026-11-27 sinovi:
+// Easybooking BAA, TOWNS=1354 (Шарджа) -> 80 qatorning hammasi Шарджа; filtrsiz — Dubay, Abu-Dabi, Ajman aralash.
+function parseTowns(html) {
+  const at = html.indexOf('controls.TOWNS');
+  if (at < 0) return [];
+  const next = html.indexOf('controls.', at + 20);
+  const block = html.slice(at, next > 0 ? next : undefined);
+  const groups = [];
+  const re = /<label class="groupname">[\s\S]*?\/>([^<]*)<\/label>|<input type="checkbox"\s+value="(\d+)"\s*\/>\s*([^<]*)<\/label>/g;
+  let m, cur = null;
+  while ((m = re.exec(block))) {
+    if (m[1] !== undefined) { cur = { name: m[1].trim(), subs: [] }; groups.push(cur); continue; }
+    const sub = { key: m[2], name: m[3].trim() };
+    if (!cur) groups.push({ name: sub.name, subs: [sub] }); else cur.subs.push(sub);
   }
-  metaCache.set(k, { hotels, at: Date.now() });
-  return hotels;
+  return groups;
+}
+// Bir xil so'rov ikki marta yuborilmaydi (ketayotgani kutiladi). Javob katta bo'lishi mumkin (Kompas BAA: 2,4 MB, 34 s) —
+// o'z vaqt chegarasi bilan, qidiruv bekor qilinsa ham fonda tugab keshga tushadi.
+const metaPending = new Map();
+async function stateMeta(op, townInc, stateInc, signal) {
+  const k = op.id + '|' + townInc + '|' + stateInc + '|meta', c = metaCache.get(k);
+  if (c && Date.now() - c.at < 6 * 3600000) return c;
+  if (!metaPending.has(k)) {
+    const p = (async () => {
+      const js = await samo(op, 'samo_action=STATEINC&TOWNFROMINC=' + townInc + '&STATEINC=' + stateInc, AbortSignal.timeout(90000));
+      const hotels = [];
+      for (const m of js.matchAll(/\{"id":(\d+),"name":"((?:[^"\\]|\\.)*)"/g)) {
+        try { hotels.push({ id: m[1], name: JSON.parse('"' + m[2] + '"') }); } catch (e) { /* buzilgan nom — o'tkazib yuboriladi */ }
+      }
+      const meta = { hotels, towns: parseTowns(unescapeJs(js)), at: Date.now() };
+      metaCache.set(k, meta);
+      return meta;
+    })().finally(() => metaPending.delete(k));
+    p.catch(() => {});
+    metaPending.set(k, p);
+  }
+  const pending = metaPending.get(k);
+  if (!signal) return pending;
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+    pending.then(resolve, reject);
+  });
+}
+// Shaharlar ro'yxati shuncha vaqtda kelmasa — qidiruv kutmaydi (natija shahar nomi bo'yicha saralanadi), ro'yxat fonda keshga tushadi
+const META_WAIT_MS = 12000;
+const within = (promise, ms) => Promise.race([promise, new Promise(resolve => setTimeout(() => resolve(null), ms).unref())]);
+const hotelsOf = async (op, townInc, stateInc, signal) => (await stateMeta(op, townInc, stateInc, signal)).hotels;
+// Tanlangan shahar -> operatorning TOWNS kodlari: guruh nomi mos kelsa — butun guruh, aks holda mos tumanlar
+function townKeys(towns, match) {
+  const keys = [];
+  towns.forEach(g => {
+    if (match(g.name)) g.subs.forEach(s => keys.push(s.key));
+    else g.subs.forEach(s => { if (match(s.name)) keys.push(s.key); });
+  });
+  return [...new Set(keys)];
 }
 async function departure(op, from, signal) {
   const s = await session(op, signal);
@@ -222,10 +274,14 @@ function parseRows(op, js) {
     const key = (n) => (cls.match(new RegExp('\\b' + n + '-(\\d+)')) || [])[1] || '';
     const tds = [...body.matchAll(/<td([^>]*)>([\s\S]*?)<\/td>/g)].map(x => ({ cls: x[1], html: x[2] }));
     const hotelTd = tds.find(t => /link-hotel/.test(t.cls));
-    const priceM = body.match(/data-cat-price="([\d.]+)"[\s\S]*?data-cat-currency="(\d+)"/) || body.match(/data-converted-price-number="([\d.]+)"/);
-    if (!hotelTd || !priceM) continue;
-    const currency = priceM[2] || attr('currency') || '2';
-    if (currency !== '2') continue;                    // faqat USD (so'rovda CURRENCY=2)
+    // Narx USD da (so'rovda CURRENCY=2). Operator narxi boshqa valyutada bo'lsa (Kompas, FlyKhiva Turkiyani EUR da beradi) —
+    // operatorning o'zi so'ralgan valyutaga o'girgan narxi (data-converted-price-number; 2026-11-27: 987.19 EUR → 1083 USD).
+    // Oldin bunday qatorlar tashlab yuborilardi va shu operatorlarning butun Turkiyasi ko'rinmasdi.
+    const cat = body.match(/data-cat-price="([\d.]+)"[\s\S]*?data-cat-currency="(\d+)"/);
+    const conv = body.match(/data-converted-price-number="([\d.]+)"/);
+    if (!hotelTd || (!cat && !conv)) continue;
+    const priceM = cat && cat[2] === '2' ? cat : conv;
+    if (!priceM) continue;
     // "Consul Hotel *** (Баку)", "Rixos 5* (Antalya)", "SAN MARINO HOTEL ** (Dubai (Deira))" — oxirgi qavs (ichma-ich ham) shahar
     let rest = text(hotelTd.html), city = '';
     if (rest.endsWith(')')) {
@@ -256,16 +312,79 @@ function parseRows(op, js) {
       dep: depM ? +depM[4] * 60 + +depM[5] : null, depDate: depM ? depM[3] + '-' + depM[2] + '-' + depM[1] : null,
       fromCode: route ? route[1] : '', toCode: route ? route[2] : '', checkIn: isoFromYmd(attr('checkin') || key('checkIn')), nights: +(attr('nights') || key('nights')),
       meal: mealCode(mealRaw), mealRaw, room, roomKey: key('roomKey'), mealKey: key('mealKey'),
-      price: Math.round(parseFloat(priceM[1])), avail: availOf(body), seats: seatsOf(body)
+      price: Math.round(parseFloat(priceM[1])), avail: availOf(body), seats: seatsOf(body),
+      ...(cat && cat[2] !== '2' ? { opPrice: Math.round(parseFloat(cat[1])), opCurrency: CURRENCY_CODE[cat[2]] || cat[2] } : {})
     });
   }
   return out;
 }
 
 // ---------- Qidiruv ----------
+// Operator natijasi sahifalab keladi (80–100 qator, FS Travel 1000), narx bo'yicha arzonidan qimmatiga (2026-11-27 da tekshirilgan).
+// Turkiyada bitta kunga 40+ sahifa (Easybooking 3200+ paket) — hammasini bitta qidiruvda olish 3–4 daqiqa. Shuning uchun:
+// birinchi qidiruvda tanlangan kunning eng arzon LIVE_MAX_PAGES sahifasi (parallel, PAGE_BATCH tadan), qolgani —
+// so'ralganda (q.page: shu sahifadan boshlab yana LIVE_MORE_PAGES sahifa; sayt: "Operatordan yana yuklash").
+const MAX_PAGES = Math.max(1, Math.min(20, Number(process.env.LIVE_MAX_PAGES) || 6));
+const MORE_PAGES = Math.max(1, Math.min(20, Number(process.env.LIVE_MORE_PAGES) || 6));
+const PAGE_BATCH = 3;                 // bitta operatorga bir vaqtda ko'pi bilan shuncha sahifa so'rovi
+const BIG_PAGE = 500;                 // sahifasi shundan katta bo'lsa (FS Travel) — bir martada bitta sahifa
+const rowKey = (r) => [r.hotelKey, r.checkIn, r.nights, r.roomKey, r.mealKey, r.tour, r.price].join('|');
+// Sahifalagich: <span class="page" data-page="13"> — joriy sahifadan keyingisi bormi
+const hasNextPage = (html, page) => [...html.matchAll(/data-page="(\d+)"/g)].some(m => +m[1] > page);
+const PAGE_SIZE = new Map();
+const countRows = (html) => (html.match(/<tr\s+class="[^"]*\bprice_info\b/g) || []).length;
+
+// start..(start+count-1) sahifalar; { rows, more, next }: more — operatorda yana sahifa bor, next — undan keyingi so'raladigan sahifa
+// onFirst — birinchi sahifa kelgach chaqiriladi (qo'shni kunlar so'rovi shundan keyin boshlanadi)
+async function pages(op, qs, start, count, signal, deadline, onFirst) {
+  // onFirst har qanday chiqishda chaqiriladi (xato, "временно недоступен") — kutib turgan so'rov osilib qolmasin
+  try { return await pagesLoop(op, qs, start, count, signal, deadline, () => { if (onFirst) { const f = onFirst; onFirst = null; f(); } }); }
+  finally { if (onFirst) onFirst(); }
+}
+async function pagesLoop(op, qs, start, count, signal, deadline, onFirst) {
+  const rows = [], seen = new Set();
+  // Birinchi sahifa doim yolg'iz so'raladi: sekin operatorda (Kompas BAA ~15 s/sahifa) 3 ta sahifa birdan so'ralsa,
+  // birinchisi ham sekinlashib vaqt chegarasidan oshardi va butun qidiruv bekor bo'lardi. Keyingilari — PAGE_BATCH tadan
+  // (sahifasi katta bo'lsa — FS Travel 1000 qator — bittadan).
+  let next = start, more = true, batch = 1;
+  const after = () => { const n = PAGE_SIZE.get(op.id); return n != null && n > BIG_PAGE ? 1 : PAGE_BATCH; };
+  while (more && next < start + count) {
+    if (next > start && Date.now() > deadline) break;       // vaqt tugadi — bor natija qoladi, "yana yuklash" mumkin
+    const list = [];
+    for (let i = 0; i < batch && next + i < start + count; i++) list.push(next + i);
+    const got = await Promise.all(list.map(p => {
+      const s = new URLSearchParams(qs); s.set('PRICEPAGE', String(p));
+      return samo(op, s.toString(), signal).then(js => ({ p, html: unescapeJs(js), js }))
+        .catch(error => { if (p === start) throw error; return null; });
+    }));
+    let halted = false;
+    for (const g of got) {
+      if (!g) { more = true; halted = true; break; }         // sahifa kelmadi — keyingi safar shundan boshlab
+      if (g.p === start && /временно недоступен/.test(g.html)) return { rows, more: false, next, closed: true };
+      const n = countRows(g.html);
+      // Oldingi sahifa "keyingisi bor" degan, bu esa bo'sh — operator xatosi/yuklama (oxirgi sahifa bo'sh kelmaydi):
+      // shu sahifadan qayta so'rash mumkin bo'lib qoladi ("yana yuklash")
+      if (!n && g.p > start) { more = true; halted = true; break; }
+      next = g.p + 1;
+      const fresh = parseRows(op, g.js).filter(r => !seen.has(rowKey(r)));
+      fresh.forEach(r => { seen.add(rowKey(r)); rows.push(r); });
+      // FS Travel sahifalagich chiqarmaydi (1000 qatorli sahifa, keyingisi PRICEPAGE bilan; 2026-11-27: BAA 5 sahifa, 4997 paket):
+      // sahifalagich yo'q va sahifa to'la bo'lsa — davomi bor deb olinadi (bo'sh keyingi sahifa "yo'q" deb tugatadi)
+      more = n > 0 && (/class="pager"/.test(g.html) ? hasNextPage(g.html, g.p) : n >= BIG_PAGE);
+      if (more) PAGE_SIZE.set(op.id, Math.max(n, PAGE_SIZE.get(op.id) || 0));
+      if (!more) break;
+    }
+    onFirst();
+    batch = after();
+    if (halted) break;
+  }
+  return { rows, more, next };
+}
+
 async function search(op, q) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), TIMEOUT);
+  const started = Date.now();
   try {
     const town = await departure(op, q.from, ctl.signal);
     if (!town) return { offers: [], note: 'no_departure' };
@@ -279,26 +398,63 @@ async function search(op, q) {
       hotelIds = (await hotelsOf(op, town.inc, st.inc, ctl.signal)).filter(h => matchHotel(h.name)).map(h => h.id).slice(0, 40);
       if (!hotelIds.length) return { offers: [], note: 'no_hotel' };
     }
+    // Shahar (kurort) tanlangan bo'lsa — operatorning o'z TOWNS filtri bilan (tumanlarni operator o'zi biladi)
+    let towns = null, cityByName = null;
+    if (q.city) {
+      const match = cityMatcher(q.city, q.country);
+      if (!match) return { offers: [], note: 'no_city' };
+      const meta = await within(stateMeta(op, town.inc, st.inc, ctl.signal).catch(() => null), META_WAIT_MS);
+      if (meta) {
+        towns = townKeys(meta.towns, match);
+        if (!towns.length) return { offers: [], note: 'no_city' };
+      } else cityByName = match;     // ro'yxat hali yo'q (sekin operator) — filtrsiz qidiruv, shahar nomi bo'yicha saralash
+    }
     const ages = (q.childAges || []).slice(0, 4);
-    // Bitta so'rovda tanlangan kun ±3 kun (sayt kunlar tasmasi uchun ham)
     const shift = (iso, n) => { const d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
     const tomorrow = shift(new Date().toISOString().slice(0, 10), 1);
     const beg = shift(q.date, -(q.window || 0)) < tomorrow ? tomorrow : shift(q.date, -(q.window || 0));
     const end = shift(q.date, q.window || 0);
-    const qs = new URLSearchParams({
-      samo_action: 'PRICES', TOWNFROMINC: town.inc, STATEINC: st.inc, TOURINC: '0', FREIGHTTYPE: '0',
-      CHECKIN_BEG: ymd(beg), CHECKIN_END: ymd(end), NIGHTS_FROM: String(q.nights), NIGHTS_TILL: String(q.nights),
-      ADULT: String(q.adults), CHILD: String(ages.length), CURRENCY: '2', PRICEPAGE: '1', DOLOAD: '1'
-    });
-    ages.forEach((a, i) => qs.set('AGES' + (i + 1), String(a)));
-    if (ages.length) qs.set('AGES', ages.join(','));
-    if (hotelIds) { qs.set('HOTELS', hotelIds.join(',')); qs.set('HOTELS_ANY', '0'); }
-    const js = await samo(op, qs.toString(), ctl.signal);
-    if (/временно недоступен/.test(unescapeJs(js))) return { offers: [], note: 'closed' };
-    const offers = parseRows(op, js).filter(o => o.checkIn >= beg && o.checkIn <= end && o.nights === q.nights
-      && (!matchHotel || matchHotel(o.hotel)));          // operator filtrni e'tiborsiz qoldirsa ham — faqat so'ralgan mehmonxona
-    return { offers, note: offers.length ? '' : 'empty' };
-  } finally { clearTimeout(timer); }
+    const qsFor = (from, till) => {
+      const qs = new URLSearchParams({
+        samo_action: 'PRICES', TOWNFROMINC: town.inc, STATEINC: st.inc, TOURINC: '0', FREIGHTTYPE: '0',
+        CHECKIN_BEG: ymd(from), CHECKIN_END: ymd(till), NIGHTS_FROM: String(q.nights), NIGHTS_TILL: String(q.nights),
+        ADULT: String(q.adults), CHILD: String(ages.length), CURRENCY: '2', PRICEPAGE: '1', DOLOAD: '1'
+      });
+      ages.forEach((a, i) => qs.set('AGES' + (i + 1), String(a)));
+      if (ages.length) qs.set('AGES', ages.join(','));
+      if (hotelIds) { qs.set('HOTELS', hotelIds.join(',')); qs.set('HOTELS_ANY', '0'); }
+      if (towns) { qs.set('TOWNS', towns.join(',')); qs.set('TOWNS_ANY', '0'); }
+      return qs.toString();
+    };
+    const deadline = started + TIMEOUT - 12000;
+    const page = Math.max(1, q.page || 1);
+    // Tanlangan kun — alohida so'rov va to'liq (eng arzonidan boshlab sahifalar). Oldin ±3 kun bitta so'rovda edi:
+    // narx bo'yicha saralangan 5 sahifaning faqat ~1/7 qismi tanlangan kunga tushardi (Easybooking: 2370 tadan 19 tasi).
+    const dayOk = q.date >= tomorrow;
+    // Qo'shni kunlar so'rovi tanlangan kunning birinchi sahifasidan keyin boshlanadi (u bilan raqobatlashmasin)
+    let firstDone;
+    const firstPage = new Promise(resolve => { firstDone = resolve; });
+    const dayP = dayOk ? pages(op, qsFor(q.date, q.date), page, page > 1 ? MORE_PAGES : MAX_PAGES, ctl.signal, deadline, firstDone) : null;
+    if (!dayOk) firstDone();
+    // Qo'shni kunlar (sayt kunlar tasmasi): ±window bo'yicha faqat birinchi sahifa — har kunning eng arzonlari
+    const windowP = page === 1 && (q.window || !dayOk)
+      ? firstPage.then(() => pages(op, qsFor(beg, end), 1, dayOk ? 1 : MAX_PAGES, ctl.signal, deadline))
+        .catch(error => { if (!dayOk) throw error; return { rows: [] }; })
+      : null;
+    const day = dayP ? await dayP : { rows: [], more: false, next: 1 };
+    const around = windowP ? await windowP : { rows: [] };
+    if (day.closed) return { offers: [], note: 'closed' };
+    const seen = new Set(day.rows.map(rowKey));
+    const rows = day.rows.concat(around.rows.filter(r => (!dayOk || r.checkIn !== q.date) && !seen.has(rowKey(r))));
+    const offers = rows.filter(o => o.checkIn >= beg && o.checkIn <= end && o.nights === q.nights
+      && (!matchHotel || matchHotel(o.hotel))            // operator filtrni e'tiborsiz qoldirsa ham — faqat so'ralgan mehmonxona
+      && (!cityByName || cityByName(o.city) || cityByName(o.hotel)));
+    // more/next: tanlangan kun bo'yicha operatorda yana paketlar bor (keyingi so'rov: page = next)
+    return { offers, note: offers.length ? '' : 'empty', more: !!(dayOk && day.more), next: day.next, cityApplied: !!towns };
+  } finally {
+    clearTimeout(timer);
+    ctl.abort();          // xato bilan chiqilganda ortda qolgan so'rovlar (qo'shni kunlar) ham to'xtaydi
+  }
 }
 
 // ---------- Faqat mehmonxona (search_hotel): reyssiz narx ----------
@@ -436,6 +592,6 @@ async function searchFlights(op, q) {
 }
 
 module.exports = {
-  search, searchHotels, searchFlights, parseRows, mealCode, seatsCode, seatsOf, COUNTRY_RU, FROM_RU, GDS_RE,
+  search, searchHotels, searchFlights, parseRows, parseTowns, townKeys, mealCode, seatsCode, seatsOf, COUNTRY_RU, FROM_RU, GDS_RE,
   logon, authCookie, authStatus, resetAuth, mergeCookies
 };

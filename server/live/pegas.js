@@ -15,6 +15,7 @@
 const { createSafeFetch } = require('./safe-http');
 const { createAuth, authError, mergeCookies, setCookiesOf } = require('./auth');
 const { hotelMatcher } = require('./hotel-match');
+const { cityMatcher } = require('../../js/cities.js');
 const { mealCode, COUNTRY_RU, FROM_RU } = require('./samo');
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36 TezBooking/1.0';
@@ -106,17 +107,33 @@ function idsByName(names, wanted) {
   return Object.keys(names).filter(id => want.includes(norm(names[id]))).map(Number);
 }
 
-// Davlatdagi mehmonxonalar: [{ id, name }]
-function hotelsOf(op, dep, country, beg, end, signal, fetchImpl) {
-  return cached([op.id, dep, country, beg, end, 'hotels'].join('|'), 6 * 3600000, async () => {
+// Davlatdagi mehmonxonalar [{ id, name }] va joylar daraxti: hudud (ty 0, "Анталья") -> shahar (ty 1, "Кемер") -> tuman (ty 2)
+// (GetOptions, Groups 128: ho.op, ho.gt; 2026-11-27 da tekshirilgan)
+function optionsOf(op, dep, country, beg, end, signal, fetchImpl) {
+  return cached([op.id, dep, country, beg, end, 'options'].join('|'), 6 * 3600000, async () => {
     const j = await call(op, '/PackageSearch/GetOptions', {
       DepartureLocationId: dep, DestinationCountryId: country, ReturnLocationId: dep, DestinationLocationId: null,
       MinOutgoingDate: beg + 'T00:00:00', MaxOutgoingDate: end + 'T00:00:00', ReturnOptionsForExternalServices: false,
       Groups: 128   // HotelOptions
     }, signal, fetchImpl);
     const names = (j.re && j.re.soitni) || {};
-    return ((j.ho && j.ho.op) || []).map(h => ({ id: h.hi, name: names[h.hi] || '' })).filter(h => h.name);
+    const places = [];
+    const walk = (nodes) => (nodes || []).forEach(n => { places.push({ id: n.id, level: n.ty, name: names[n.id] || '' }); walk(n.ch); });
+    walk(j.ho && j.ho.gt);
+    return {
+      hotels: ((j.ho && j.ho.op) || []).map(h => ({ id: h.hi, name: names[h.hi] || '' })).filter(h => h.name),
+      places: places.filter(p => p.name)
+    };
   });
+}
+const hotelsOf = async (...args) => (await optionsOf(...args)).hotels;
+// Tanlangan shahar -> Pegas qidiruv maydonlari: mos hudud bo'lsa — butun hudud, aks holda mos shaharlar, aks holda tumanlar
+function placeFilter(places, match) {
+  for (const [level, field] of [[0, 'HotelRegionIds'], [1, 'HotelLocationIds'], [2, 'HotelLocationAreaIds']]) {
+    const ids = places.filter(p => p.level === level && match(p.name)).map(p => p.id);
+    if (ids.length) return { [field]: ids };
+  }
+  return null;
 }
 
 // ---------- Natijalar ----------
@@ -197,8 +214,15 @@ async function search(op, q, { fetchImpl = safeFetch } = {}) {
       hotelIds = (await hotelsOf(op, dep, direction.dci, beg, end, signal, fetchImpl)).filter(h => matchHotel(h.name)).map(h => h.id).slice(0, 50);
       if (!hotelIds.length) return { offers: [], note: 'no_hotel' };
     }
+    // Shahar (kurort) tanlangan bo'lsa — Pegas'ning o'z hudud/shahar filtri bilan
+    let place = null;
+    if (q.city) {
+      const match = cityMatcher(q.city, q.country);
+      place = match ? placeFilter((await optionsOf(op, dep, direction.dci, beg, end, signal, fetchImpl)).places, match) : null;
+      if (!place) return { offers: [], note: 'no_city' };
+    }
     const ages = (q.childAges || []).slice(0, 4);
-    const j = await call(op, '/PackageSearch/Search', {
+    const j = await call(op, '/PackageSearch/Search', Object.assign({
       DepartureLocationId: dep, ReturnLocationId: direction.rli || dep, DestinationCountryId: direction.dci, DestinationLocationId: null,
       Adults: q.adults, ChildAges: ages.length ? ages : null, DepartureDates: dates, DurationsInNights: [q.nights], ReturnDates: [],
       PackageId: null, PackageSpoTypeIds: null, BasicFares: null, PaymentCurrencyId: USD_ID, MinPrice: null, MaxPrice: null,
@@ -208,14 +232,14 @@ async function search(op, q, { fetchImpl = safeFetch } = {}) {
       FlightAvailabilityAvailable: true, FlightAvailabilityOnRequest: true, GroupByHotel: false,
       RenderAlternativeReturnLocations: false, LanguageCode: null, ShowPackagesWithExternalServices: false,
       OutgoingFlightClassType: null, ReturnFlightClassType: null, OutgoingDatesPeriodModel: null, ReturnDatesPeriodModel: null
-    }, signal, fetchImpl);
+    }, place || {}), signal, fetchImpl);
     const offers = parseItems(op, j).filter(o => o.checkIn >= beg && o.checkIn <= end && o.nights === q.nights
       && (!matchHotel || matchHotel(o.hotel)));
-    return { offers, note: offers.length ? '' : 'empty' };
+    return { offers, note: offers.length ? '' : 'empty', cityApplied: !!place };
   } finally { clearTimeout(timer); }
 }
 
 const authStatus = (id, env) => auth.status(id, env);
 function resetAuth(id) { auth.reset(id); if (!id) cache.clear(); }
 
-module.exports = { search, parseItems, logon, authStatus, resetAuth, call, _auth: auth };
+module.exports = { search, parseItems, placeFilter, logon, authStatus, resetAuth, call, _auth: auth };

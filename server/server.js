@@ -356,7 +356,7 @@ if (process.env.TEZ_DEMO_AGENTS === '1') {
   try {
     const liveWorkers = require('./owner/live-workers').registerLiveWorkers({
       live, service: ownerService, workers: ownerWorkers,
-      maxOffers: Number(process.env.AGENT_LIVE_MAX_OFFERS) || 30,
+      maxOffers: Number(process.env.AGENT_LIVE_MAX_OFFERS) || 200,
       uzsRate: (() => { try { return require('./telegram/post').loadSite(ROOT).TB.UZS_RATE; } catch (e) { return 0; } })()
     });
     agentWorkersInfo = liveWorkers.length + ' ta operator ishchisi (jonli qidiruv)';

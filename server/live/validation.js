@@ -81,7 +81,16 @@ function parseLiveQuery(kind, url, { countries, now = Date.now() }) {
   if (cityValues.length > 1) return null;
   const city = cityValues.length ? cityValues[0].replace(/\s+/g, ' ').trim() : '';
   if (city && (city.length > 60 || !/^[\p{L}\p{N} '’ʻ.-]+$/u.test(city))) return null;
+  // "Operatordan yana yuklash": bitta operator (op) va uning keyingi natija sahifasi (page) — ikkalasi birga
+  const opValues = params.getAll('op'), pageValues = params.getAll('page');
+  if (opValues.length > 1 || pageValues.length > 1 || (opValues.length !== pageValues.length)) return null;
   const query = { country: countryValues[0], date, nights, adults, childAges, from, window };
+  if (opValues.length) {
+    const page = integerParam(params, 'page', 2, 100);
+    if (!/^[a-z]{2,20}$/.test(opValues[0]) || page === null) return null;
+    query.op = opValues[0];
+    query.page = page;
+  }
   if (hotel) query.hotel = hotel;
   if (city) query.city = city;
   return query;

@@ -56,8 +56,17 @@ const OPERATORS = [
 ];
 // Sayt/bot qidiruvi bitta operatorni ko'pi bilan shuncha kutadi (Asialuxe sekin); qolganlar natijasi baribir qaytadi
 const SITE_WAIT_MS = Number(process.env.LIVE_SITE_WAIT_MS) || 50000;
-const CACHE_MS = 10 * 60000;
-const PER_OP = 400;
+// Paketlar operator saytlarida o'zgarib turadi (narx, joy, yangi paketlar): faol qidiruvlar har LIVE_REFRESH_MS da
+// (sukut bo'yicha 5 daqiqa) fon rejimida operatorlardan qayta tortiladi. Faol — oxirgi LIVE_ACTIVE_MS ichida sayt, bot
+// yoki agent so'ragan. Yangi natija kelguncha eskisi beriladi; 0 — fon yangilash o'chiq.
+const REFRESH_MS = (() => { const v = Number(process.env.LIVE_REFRESH_MS); return Number.isFinite(v) && v >= 0 ? (v && Math.max(60000, v)) : 5 * 60000; })();
+const ACTIVE_MS = Math.max(60000, Number(process.env.LIVE_ACTIVE_MS) || 30 * 60000);
+const MAX_REFRESH = 30;                       // bir aylanishda ko'pi bilan shuncha qidiruv yangilanadi (operatorlarga yuklama)
+const REFRESH_PARALLEL = 2;                   // fon yangilashda bir vaqtda nechta qidiruv
+const CACHE_MS_NO_REFRESH = 10 * 60000;
+// Bitta operatordan bitta so'rovda ko'pi bilan shuncha taklif. SAMO: tanlangan kun 6 × ~100 + qo'shni kunlar ~100,
+// FS Travel sahifasi 1000; Pegas 500. Oldin 600 edi: FlyKhiva Turkiyasida tanlangan kunning bir qismi kesilib ketardi.
+const PER_OP = Math.max(100, Math.min(5000, Number(process.env.LIVE_PER_OPERATOR) || 2000));
 const MAX_CACHE = 300;
 const ROUTES = { '/api/live/tours': 'tours', '/api/live/hotels': 'hotels', '/api/live/flights': 'flights' };
 
@@ -80,7 +89,7 @@ function configFromEnv(env = process.env) {
     maxQueue: envInteger(env, 'LIVE_MAX_QUEUE', 200, 0, 10000),
     perClientRate: envInteger(env, 'LIVE_RATE_PER_MIN', 20, 1, 10000),
     globalRate: envInteger(env, 'LIVE_GLOBAL_RATE_PER_MIN', 300, 1, 100000),
-    timeoutMs: envInteger(env, 'LIVE_TIMEOUT_MS', 25000, 1000, 120000),
+    timeoutMs: envInteger(env, 'LIVE_TIMEOUT_MS', 40000, 1000, 120000),
     tourTickets: (env.LIVE_TOUR_TICKETS || '0').trim() === '1'
   };
 }
@@ -103,10 +112,14 @@ function createLive({
   now = Date.now,
   config,
   siteWaitMs = SITE_WAIT_MS,
-  env = process.env
+  env = process.env,
+  refreshMs = REFRESH_MS,
+  activeMs = ACTIVE_MS
 }) {
   // Sayt va Telegram bot: login talab qiladigan operator faqat login berilgan bo'lsa
   const publicOperators = operators.filter(op => !op.loginOnly || hasCredentials(op.id, env));
+  // Natija shuncha vaqt yangi hisoblanadi: fon yangilash yoqiq bo'lsa — uning davri (5 daqiqa), aks holda 10 daqiqa
+  const CACHE_MS = refreshMs ? Math.max(refreshMs, 60000) : CACHE_MS_NO_REFRESH;
   const settings = Object.assign(configFromEnv(), config || {});
   const cache = new Map();
   const health = {};
@@ -164,16 +177,23 @@ function createLive({
         limiter.run(operator.id, () => searches.tours(operator, query)),
         ticketsFor(operator, query)
       ]);
-      return { offers: withTickets(tours.offers, tickets, query.nights), note: tours.note };
+      return { offers: withTickets(tours.offers, tickets, query.nights), note: tours.note, more: tours.more, next: tours.next, cityApplied: tours.cityApplied };
     }
     if (kind === 'hotels') {
       const hotels = await limiter.run(operator.id, () => searches.hotels(operator, query));
       if (hotels.offers.length || typeof searches.tours !== 'function') return hotels;
       // "Faqat mehmonxona" yo'q — mehmonxona tur paket ichidan (Toshkentdan): chipta ma'lum bo'lsa paket − chipta,
       // aks holda paket narxi "aviareys bilan" belgisi bilan (bo'linma o'ylab topilmaydi)
-      const tq = Object.assign({}, query, { from: 'tas' });
+      // Kalit tartibi sayt tur so'rovi bilan bir xil (parseLiveQuery): Toshkentdan shu tur qidiruvi keshda yoki ketayotgan bo'lsa —
+      // o'sha natija olinadi, operatorga ikkinchi marta (5–6 sahifa) so'rov yuborilmaydi
+      const tq = { country: query.country, date: query.date, nights: query.nights, adults: query.adults, childAges: query.childAges, from: 'tas', window: query.window || 0 };
+      const shared = cache.get('tours' + JSON.stringify(tq));
+      const fromShared = shared && (shared.data ? Promise.resolve(shared.data) : shared.promise.catch(() => null)).then(d => {
+        const st = d && d.operators.find(s => s.id === operator.id);
+        return st && st.status !== 'error' && st.status !== 'busy' ? { offers: d.offers.filter(o => o.opId === operator.id) } : null;
+      });
       const [tours, tickets] = await Promise.all([
-        limiter.run(operator.id, () => searches.tours(operator, tq)).catch(() => ({ offers: [] })),
+        (fromShared || Promise.resolve(null)).then(hit => hit || limiter.run(operator.id, () => searches.tours(operator, tq))).catch(() => ({ offers: [] })),
         ticketsFor(operator, tq, 'tas')
       ]);
       const derived = withTickets(tours.offers || [], tickets, query.nights).map(o => {
@@ -202,6 +222,10 @@ function createLive({
         ms: now() - started,
         offers
       };
+      // Operatorda shu kun bo'yicha yana paketlar bor (narx bo'yicha keyingi sahifalar): sayt "Operatordan yana yuklash"
+      if (response.more && response.next > 1) Object.assign(result, { more: true, next: response.next });
+      // Operator shaharni o'zi filtrladi (SAMO TOWNS, Pegas hudud, Asialuxe shahar) — agent nom bo'yicha qayta saralamaydi
+      if (response.cityApplied) result.cityApplied = true;
     } catch (error) {
       const failure = safeFailure(error);
       result = { id: operator.id, ...failure, count: 0, ms: now() - started, offers: [] };
@@ -217,10 +241,12 @@ function createLive({
       const late = new Promise(resolve => { timer = setTimeout(() => resolve({ id: operator.id, status: 'error', error: 'timeout', count: 0, ms: siteWaitMs, offers: [] }), siteWaitMs); });
       return Promise.race([runOperator(kind, operator, query), late]).finally(() => clearTimeout(timer));
     };
-    const results = await Promise.all(publicOperators.map(capped));
+    // query.op — faqat shu operator (sayt: "Operatordan yana yuklash", query.page dan boshlab)
+    const list = query.op ? publicOperators.filter(op => op.id === query.op) : publicOperators;
+    const results = await Promise.all(list.map(capped));
     return {
       offers: [].concat(...results.map(result => result.offers)),
-      operators: results.map(({ id, status, count, ms, error }) => ({ id, status, count, ms, error })),
+      operators: results.map(({ id, status, count, ms, error, more, next, cityApplied }) => ({ id, status, count, ms, error, more, next, cityApplied })),
       at: now()
     };
   }
@@ -254,20 +280,22 @@ function createLive({
     if (!query) return sendJson(res, 400, { error: 'bad_request' });
 
     const { entry, data } = await cachedSearch(kind, query);
-    return sendJson(res, 200, Object.assign({ cached: !!entry.fromCache && now() - data.at > 1000 }, data));
+    // age — natija operatorlardan necha ms oldin olingan (brauzer soati server soatidan farq qilsa ham to'g'ri hisoblash uchun)
+    return sendJson(res, 200, Object.assign({ cached: !!entry.fromCache && now() - data.at > 1000, age: Math.max(0, now() - data.at) }, data));
   }
 
   // Kesh orqali qidiruv (sayt va Telegram bot uchun umumiy: bir xil so'rov operatorlarga ikki marta yuborilmaydi)
   async function cachedSearch(kind, query) {
     const key = kind + JSON.stringify(query);
     let entry = cache.get(key);
-    if (entry && now() - entry.at > CACHE_MS) {
+    // Fon yangilanishi ketayotgan bo'lsa — eski natija beriladi (yangisi bir necha soniyada keladi)
+    if (entry && now() - entry.at > CACHE_MS && !entry.refreshing) {
       cache.delete(key);
       entry = null;
     }
     if (entry) entry.fromCache = !!entry.data;
     if (!entry) {
-      entry = { at: now(), promise: searchAll(kind, query) };
+      entry = { at: now(), kind, query, promise: searchAll(kind, query) };
       cache.set(key, entry);
       if (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value);
       entry.promise.then(data => {
@@ -275,8 +303,95 @@ function createLive({
         entry.at = now();
       }, () => cache.delete(key));
     }
+    entry.usedAt = now();
     const data = entry.data || await entry.promise;
     return { entry, data };
+  }
+
+  // Yangi natija eskisining o'rniga. Operator bu safar xato bersa (vaqt tugadi, band) — uning oldingi paketlari qoladi
+  // (bitta sekin javob tufayli ustun bo'shab qolmasin); boshqa holatlar (bo'sh, sotuv yopildi) — yangisi.
+  function mergeFresh(old, fresh) {
+    if (!old) return fresh;
+    const failed = (s) => s && (s.status === 'error' || s.status === 'busy');
+    const keep = new Set(fresh.operators.filter(s => failed(s)).map(s => s.id)
+      .filter(id => { const o = old.operators.find(x => x.id === id); return o && !failed(o) && o.count > 0; }));
+    if (!keep.size) return fresh;
+    return Object.assign({}, fresh, {
+      offers: fresh.offers.concat(old.offers.filter(o => keep.has(o.opId))),
+      operators: fresh.operators.map(s => keep.has(s.id) ? Object.assign({}, old.operators.find(x => x.id === s.id), { stale: true }) : s)
+    });
+  }
+
+  // Fon yangilash: faol qidiruvlar (sayt, bot, agentlar) har refreshMs da operatorlardan qayta tortiladi
+  function refreshDue() {
+    if (!refreshMs) return [];
+    const t = now();
+    const due = [];
+    const failedOf = (entry) => entry.data.operators.filter(s => s.status === 'error' || s.status === 'busy').map(s => s.id);
+    cache.forEach(entry => {
+      if (!entry.data || entry.refreshing || entry.query.op) return;            // "yana yuklash" sahifalari yangilanmaydi
+      if (t - (entry.usedAt || entry.at) > activeMs) return;                   // hech kim ko'rmayapti
+      if (t - entry.at >= refreshMs - 30000) { due.push({ entry, at: entry.at }); return; }
+      // Biror operator vaqtga sig'magan / band bo'lgan — 5 daqiqa kutilmaydi: 1 daqiqadan keyin faqat o'sha operator(lar) qayta so'raladi
+      const failed = failedOf(entry);
+      if (failed.length && t - (entry.retryAt || entry.at) >= 60000) due.push({ entry, at: entry.retryAt || entry.at, only: failed });
+    });
+    oneCache.forEach(entry => {
+      if (!entry.result || entry.refreshing) return;
+      if (t - (entry.usedAt || entry.at) > activeMs) return;
+      if (t - entry.at >= refreshMs - 30000) due.push({ entry, at: entry.at });
+    });
+    return due.sort((a, b) => a.at - b.at).slice(0, MAX_REFRESH);
+  }
+  // Navbat bilan, bir vaqtda REFRESH_PARALLEL ta qidiruv: aks holda 30 qidiruv × 15 operator navbatni (LIVE_MAX_QUEUE) to'ldirib,
+  // haqiqiy foydalanuvchi qidiruvi "band" (busy) bo'lib qolardi. Oldingi aylanish tugamagan bo'lsa — yangisi boshlanmaydi.
+  let ticking = false;
+  async function refreshTick() {
+    if (ticking) return 0;
+    ticking = true;
+    try {
+      const due = refreshDue();
+      due.forEach(job => { job.entry.refreshing = true; });
+      let i = 0;
+      await Promise.all(Array.from({ length: Math.min(REFRESH_PARALLEL, due.length) }, async () => {
+        while (i < due.length) await refreshOne(due[i++]);
+      }));
+      return due.length;
+    } finally { ticking = false; }
+  }
+  async function refreshOne({ entry, only }) {
+    try {
+      if (entry.operator) {
+        const result = await runOperator(entry.kind, entry.operator, entry.query);
+        if (result.status !== 'error' && result.status !== 'busy') { entry.result = result; entry.promise = Promise.resolve(result); }
+        entry.at = now();
+      } else if (only) {
+        // Faqat xato bergan operatorlar: natijasi eski ma'lumot ichida almashtiriladi, umumiy yangilash vaqti (at) o'zgarmaydi
+        const ops = publicOperators.filter(op => only.includes(op.id));
+        const results = await Promise.all(ops.map(op => runOperator(entry.kind, op, entry.query)));
+        const byId = new Map(results.map(r => [r.id, r]));
+        const pick = ({ id, status, count, ms, error, more, next, cityApplied }) => ({ id, status, count, ms, error, more, next, cityApplied });
+        entry.data = Object.assign({}, entry.data, {
+          offers: entry.data.offers.filter(o => !byId.has(o.opId)).concat(...results.map(r => r.offers)),
+          operators: entry.data.operators.map(s => (byId.has(s.id) ? pick(byId.get(s.id)) : s))
+        });
+        entry.promise = Promise.resolve(entry.data);
+        entry.retryAt = now();
+      } else {
+        const fresh = await searchAll(entry.kind, entry.query);
+        entry.data = mergeFresh(entry.data, fresh);
+        entry.promise = Promise.resolve(entry.data);
+        entry.at = now();
+        entry.retryAt = 0;
+      }
+    } catch (error) { /* keyingi aylanishda qayta urinadi */ } finally {
+      entry.refreshing = false;
+    }
+  }
+  let refreshTimer = null;
+  if (refreshMs) {
+    refreshTimer = setInterval(() => { refreshTick().catch(() => {}); }, Math.min(60000, Math.max(10000, Math.round(refreshMs / 5))));
+    if (refreshTimer.unref) refreshTimer.unref();
   }
 
   function queryOf(kind, params) {
@@ -301,29 +416,36 @@ function createLive({
     const query = queryOf(kind, params);
     const key = kind + JSON.stringify(query);
     const shared = cache.get(key);
-    if (shared && shared.data && now() - shared.at <= CACHE_MS) {
+    if (shared && shared.data && (now() - shared.at <= CACHE_MS || shared.refreshing)) {
       const status = shared.data.operators.find(op => op.id === operatorId);
       if (status && status.status !== 'error' && status.status !== 'busy') {
-        return Object.assign({}, status, { offers: shared.data.offers.filter(o => o.opId === operatorId), cached: true });
+        shared.usedAt = now();
+        return Object.assign({}, status, { offers: shared.data.offers.filter(o => o.opId === operatorId), cached: true, at: shared.at });
       }
     }
     const oneKey = key + '|' + operatorId;
     let entry = oneCache.get(oneKey);
-    if (entry && now() - entry.at > CACHE_MS) { oneCache.delete(oneKey); entry = null; }
+    if (entry && now() - entry.at > CACHE_MS && !entry.refreshing) { oneCache.delete(oneKey); entry = null; }
+    const hit = !!(entry && entry.result);
     if (!entry) {
-      entry = { at: now(), promise: runOperator(kind, operator, query) };
+      entry = { at: now(), kind, operator, query, promise: runOperator(kind, operator, query) };
       oneCache.set(oneKey, entry);
       if (oneCache.size > MAX_CACHE) oneCache.delete(oneCache.keys().next().value);
       entry.promise.then(result => {
         if (result.status === 'error' || result.status === 'busy') oneCache.delete(oneKey);
-        else entry.at = now();
+        else { entry.result = result; entry.at = now(); }
       });
     }
+    entry.usedAt = now();
     const result = await entry.promise;
-    return Object.assign({}, result, { cached: false });
+    return Object.assign({}, result, { cached: hit, at: entry.at });
   }
 
-  return { handle, search, searchOne, authStatus, OPERATORS: operators, stats: () => limiter.stats() };
+  return {
+    handle, search, searchOne, authStatus, OPERATORS: operators, stats: () => limiter.stats(),
+    refreshTick, refreshMs,
+    stop: () => { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = null; }
+  };
 }
 
 module.exports = { createLive, configFromEnv, parseLiveQuery, OPERATORS };

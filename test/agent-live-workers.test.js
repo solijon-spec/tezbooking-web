@@ -78,7 +78,8 @@ test('taklif formati normalizatordan o\'tadi: uchish, GDS, mavjudlik, chiqish sa
   assert.equal(n.flightIncluded, true);
   assert.equal(n.verificationStatus, 'unverified');
   assert.deepEqual(liveParams(params({ childrenAges: [5, 9], departureAirport: 'skd' })), {
-    country: 'tr', date: params().date, nights: '7', adults: '2', from: 'skd', window: '3', children: '5,9', city: 'Antalya'
+    // ro'yxatdagi shahar — js/cities.js id'si (sayt filtri bilan bir xil kalit)
+    country: 'tr', date: params().date, nights: '7', adults: '2', from: 'skd', window: '3', children: '5,9', city: 'antalya'
   });
   // Butun davlat (kurort yo'q) — shahar uzatilmaydi
   assert.equal('city' in liveParams(params({ destination: 'Turkey' })), false);

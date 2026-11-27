@@ -31,8 +31,9 @@
   const MAX_ADULTS = 8, MAX_CHILDREN = 4, MAX_ROOMS = 4, ADULTS_PER_ROOM = 4;
   const DEFAULT_CHILD_AGE = 7;
   const TOUR_PAGE = 30;                                // "Turlar bo'yicha": bir sahifada nechta tur
+  const BOARD_PAGE = 50;                               // "Operatorlar bo'yicha": ustunda dastlab nechta paket
   // Qidiruv yoki filtr o'zgarsa — turlar ro'yxati yana boshidan (birinchi sahifa) ko'rsatiladi
-  const LIST_KEYS = ['tab', 'dests', 'date', 'nights', 'from', 'adults', 'childAges', 'rooms', 'ops', 'stars', 'meals', 'cities',
+  const LIST_KEYS = ['tab', 'dests', 'date', 'nights', 'city', 'from', 'adults', 'childAges', 'rooms', 'ops', 'stars', 'meals', 'cities',
     'onlyAvail', 'instant', 'withTicket', 'gdsOnly', 'noGds', 'maxPrice', 'hotelQuery', 'sort', 'groupBy'];
   const ALL_IDS = D.COUNTRIES.map(c => c.id);
   const today = dt.localToday();
@@ -87,6 +88,7 @@
     my: loadMy(),                 // agentlik ishlaydigan davlatlar
     dests: null,                  // qidiruvdagi davlatlar (null = birinchisi)
     date: dt.addDays(today, 7), nights: 7,
+    city: '',                     // qidiruvdagi shahar (js/cities.js id'si), '' — butun davlat
     adults: 2, childAges: [], rooms: 1,
     ops: {}, stars: {}, meals: {}, cities: {},   // filtrlar: false = o'chirilgan
     onlyAvail: false, instant: false, maxPrice: null, hotelQuery: '',
@@ -105,7 +107,13 @@
     // (serverga hotel= bilan, server/live/hotel-match.js); '' — barcha mehmonxonalar
     hotelFocus: '',
     // Natijalar ko'rinishi: 'tour' — har bir tur alohida (narx bo'yicha), 'hotel' — mehmonxona bo'yicha guruhlangan
-    groupBy: store.get('groupBy', 'tour') === 'hotel' ? 'hotel' : 'tour',
+    // 'op' — operatorlar bo'yicha taxta (har operator — ustun, ichida paketlar arzonidan qimmatiga). Bir marta hammaga yoqiladi.
+    groupBy: (() => {
+      const g = store.get('board1', false) ? store.get('groupBy', 'op') : 'op';
+      if (!store.get('board1', false)) { store.set('board1', true); store.set('groupBy', 'op'); }
+      return ['op', 'tour', 'hotel'].indexOf(g) >= 0 ? g : 'op';
+    })(),
+    opLimit: {},                  // taxtada har operator ustunida nechta paket ko'rsatiladi (sukut BOARD_PAGE)
     tourLimit: TOUR_PAGE,         // "Turlar bo'yicha" ro'yxatida nechta ko'rsatiladi
     detail: null, detailKey: null, // "Batafsil" oynasi: mehmonxona id va tanlangan taklif kaliti
     photo: 0,                     // "Batafsil" galereyasida ko'rinayotgan rasm
@@ -289,7 +297,7 @@
   function dateButton(id, field, value, label) {
     const busy = bookedDays()[value];
     return `
-    <div class="field f-date"${field === 'fRet' ? ' data-key="ret"' : ''}>
+    <div class="field f-date"${field === 'fRet' ? ' data-key="ret"' : field === 'tRet' ? ' data-key="tret"' : ''}>
       <label for="${id}" class="label">${esc(label)}</label>
       <button type="button" id="${id}" class="input date-btn" data-action="pickDate" data-arg="${field}" aria-haspopup="dialog">
         ${I.cal}<span class="grow ellipsis">${esc(fmtLong(value))}</span>${busy ? '<i class="date-dot" aria-hidden="true"></i>' : ''}
@@ -355,8 +363,15 @@
 
   // ---------- Hisoblash: holatdan ko'rinish uchun ma'lumot ----------
   let offerIndex = {}; // taklif kaliti -> { h, o }
+  // Qidiruvdagi shahar (kurort): faqat tanlangan davlatlardan biriniki bo'lsa (Turlar bo'limida). Operatorlar o'zida shu shahar bo'yicha qidiradi.
+  const CITY_LIST = (window.TB_CITIES && window.TB_CITIES.CITIES) || [];
+  const cityById = (id) => CITY_LIST.find(c => c.id === id) || null;
+  const activeCity = () => {
+    const c = !isHotels() && state.city ? cityById(state.city) : null;
+    return c && destList().indexOf(c.country) >= 0 ? c : null;
+  };
   const query = () => ({ from: state.from, nights: state.nights, adults: state.adults, childAges: state.childAges, rooms: state.rooms, noFlight: isHotels(),
-    hotel: isHotels() ? '' : state.hotelFocus });
+    hotel: isHotels() ? '' : state.hotelFocus, city: activeCity() ? activeCity().id : '' });
   // Mehmonxona nomi mosligi (serverdagi hotel-match.js bilan bir xil qoida): muhim so'zlarning har biri nomda so'z boshi sifatida
   const HOTEL_GENERIC = ['hotel', 'hotels', 'otel', 'отель', 'resort', 'resorts', 'spa', 'the', 'and', 'by'];
   const hotelWords = (s) => String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^\p{L}\p{N}]+/gu, ' ').trim().split(' ').filter(Boolean);
@@ -511,6 +526,10 @@
   // Server topilsa va jonli qidiruv ishlasa — demo mehmonxonalar o'rniga operatorlarning haqiqiy takliflari ko'rsatiladi.
   let liveReady = false;
   const livePending = {};          // sig -> true (so'rov ketgan)
+  const LIVE_REFRESH_MS = 5 * 60000; // jonli natija shuncha vaqtdan keyin yangisi so'raladi (server ham shu davrda yangilaydi)
+  const liveChecked = {};          // sig -> oxirgi yangilash tekshiruvi vaqti
+  const opLoading = {};            // taxta: operator id -> keyingi sahifalar yuklanmoqda
+  const opLoadFailed = {};         // operator id -> oxirgi xato vaqti
   const liveFailed = {};           // sig -> xato matni
   const isLive = () => liveReady && (state.tab === 'tours' || state.tab === 'hotels');
   const isLiveF = () => liveReady && state.tab === 'flights';
@@ -554,16 +573,22 @@
     }).then(() => { sigs.forEach(s => { delete liveFPending[s]; }); render(); });
   }
   function liveStatus(dests, q) {
-    let loading = 0, done = 0, failed = 0;
+    let loading = 0, done = 0, failed = 0, at = 0;
     const ops = {};
     dests.forEach(c => {
       const sig = D.live.sig(c, q, state.date);
       const e = D.live.entry(c, q, state.date);
-      if (e) { done++; e.ops.forEach(o => { if (o.status === 'ok') ops[o.id] = (ops[o.id] || 0) + o.count; }); }
+      if (e && e.partial && livePending[sig]) loading++;
+      else if (e) {
+        done++; e.ops.forEach(o => { if (o.status === 'ok') ops[o.id] = (ops[o.id] || 0) + o.count; });
+        at = at ? Math.min(at, e.srvAt || e.at) : (e.srvAt || e.at);
+      }
       else if (liveFailed[sig]) failed++;
       else loading++;
     });
-    return { loading, done, failed, ops: Object.keys(ops).length };
+    // Operatorlardan olingan vaqt (soat:daqiqa) — har 5 daqiqada yangilanadi
+    const time = at ? new Date(at).toLocaleTimeString(state.lang === 'en' ? 'en-GB' : 'ru-RU', { hour: '2-digit', minute: '2-digit' }) : '';
+    return { loading, done, failed, ops: Object.keys(ops).length, time };
   }
   function fetchLive() {
     fetchLiveFlights();
@@ -575,16 +600,37 @@
     destList().forEach(c => {
       const sig = D.live.sig(c, q, state.date);
       // Xato bo'lsa — darhol qayta so'ralmaydi (aks holda har chizishda so'rov ketib, limitga uriladi)
-      if (D.live.entry(c, q, state.date) || livePending[sig] || (liveFailed[sig] && Date.now() - liveFailed[sig].at < 60000)) return;
+      // Qo'shni kun so'rovidan kelgan (qisman) natija — shu kun tanlanganda to'liq so'raladi
+      const have = D.live.entry(c, q, state.date);
+      // Har 5 daqiqada yangilanadi: server faol qidiruvlarni operatorlardan qayta tortadi, sayt yangisini jimgina oladi
+      // (eski natija yangisi kelguncha ko'rinib turadi). Bir qidiruv daqiqada ko'pi bilan bir marta tekshiriladi.
+      // Biror operator vaqtga sig'magan bo'lsa — server uni ~1 daqiqada qayta so'raydi, sayt ham shunda yangisini oladi
+      const failedIds = have ? have.ops.filter(o => o.status === 'error' || o.status === 'busy').map(o => o.id) : [];
+      const ageStale = have && !have.partial && Date.now() - (have.srvAt || have.at) > LIVE_REFRESH_MS + 20000;
+      // Faqat xato bergan operatorlar uchun qayta so'rash: boshqa operatorlar natijasi (va "yana yuklash" sahifalari) o'zgarmaydi
+      const retryOnly = !ageStale && have && !have.partial && failedIds.length > 0 && Date.now() - have.at > 75000;
+      const stale = (ageStale || retryOnly) && !(Date.now() - (liveChecked[sig] || 0) < 60000);
+      if ((have && !have.partial && !stale) || livePending[sig] || (liveFailed[sig] && Date.now() - liveFailed[sig].at < 60000)) return;
+      if (stale) liveChecked[sig] = Date.now();
       const sigs = days.map(d => D.live.sig(c, q, d)).filter(s => !livePending[s]);
       sigs.forEach(s => { livePending[s] = true; delete liveFailed[s]; });
       const params = new URLSearchParams({ country: c, date: state.date, window: 3, nights: q.nights, adults: q.adults, children: q.childAges.join(',') });
       if (!hotelsOnly) params.set('from', q.from);
       if (!hotelsOnly && q.hotel) params.set('hotel', q.hotel);     // har bir operator o'zida faqat shu mehmonxonani qidiradi
+      if (!hotelsOnly && q.city && (cityById(q.city) || {}).country === c) params.set('city', q.city);   // operatorning o'z shahar filtri
+      const base = state.date;
       sync.request('/api/live/' + (hotelsOnly ? 'hotels' : 'tours') + '?' + params, {}, 60000).then(data => {
+        if (stale && retryOnly) {
+          D.live.set(c, q, base, { operators: (data.operators || []).filter(x => failedIds.includes(x.id)),
+            offers: (data.offers || []).filter(o => failedIds.includes(o.opId) && o.checkIn === base) }, true);
+          return;
+        }
         days.forEach(d => {
-          if (D.live.entry(c, q, d) && d !== state.date) return;
-          D.live.set(c, q, d, { operators: data.operators, offers: (data.offers || []).filter(o => o.checkIn === d) });
+          if (D.live.entry(c, q, d) && d !== base) return;
+          // Qo'shni kunlar — faqat eng arzonlari (server tanlangan kunni to'liq, qolganlarini 1-sahifa bilan oladi)
+          D.live.set(c, q, d, { operators: d === base ? data.operators : (data.operators || []).map(x => Object.assign({}, x, { more: false })),
+            offers: (data.offers || []).filter(o => o.checkIn === d), partial: d !== base && !hotelsOnly,
+            at: typeof data.age === 'number' ? Date.now() - data.age : data.at });
         });
       }).catch(err => {
         liveFailed[sig] = { at: Date.now(), error: err.message || 'error' };
@@ -695,6 +741,33 @@
       canBook: bookable(o), bookLabel: bookable(o) ? actionLabel(o) : t('stop_btn'), added: inOffer(o.key), facts: hotelFacts(h),
       photos: hotelGallery(h).length, pk: packageView(o), client: clientLine(o.price)
     }));
+
+    // "Operatorlar bo'yicha" (taxta): har operator — alohida ustun; ichida shu filtr bo'yicha uning barcha paketlari,
+    // operator saytidagidek eng arzonidan qimmatiga (sotuvdan chiqqanlari oxirida). Ustunlar — eng arzon paketi bo'yicha.
+    const board = state.groupBy !== 'op' ? [] : (() => {
+      const byOp = {};
+      allTours.forEach(x => { (byOp[x.o.op.id] = byOp[x.o.op.id] || []).push(x); });
+      // Operatorda shu kun bo'yicha yana sahifalar bormi (server: more/next)
+      const opMoreOn = {};
+      if (liveMode) dests.forEach(c => { const e = D.live.entry(c, q, state.date); if (e) e.ops.forEach(x => { if (x.more) opMoreOn[x.id] = true; }); });
+      return Object.keys(byOp).map(id => {
+        const rows = byOp[id].slice().sort((a, b) => tRank(a) - tRank(b) || a.o.price - b.o.price);
+        const op = rows[0].o.op;
+        const limit = state.opLimit[id] || BOARD_PAGE;
+        const cheapest = rows.find(x => bookable(x.o)) || rows[0];
+        return {
+          id, name: op.name, color: op.color, site: op.site, count: rows.length, cheapest: cheapest.o.price,
+          from: money(shown(cheapest.o.price)), more: Math.max(0, rows.length - limit),
+          opMore: !!opMoreOn[id], opLoading: !!opLoading[id], opFailed: !!opLoadFailed[id] && !opLoading[id] && Date.now() - opLoadFailed[id] < 60000,
+          rows: rows.slice(0, limit).map(({ h, o }) => ({
+            key: o.key, name: h.name, stars: h.stars, place: cityName(h.city), meal: o.meal, mealLong: mealLong(o.meal), room: roomName(o.room),
+            gds: !!o.gds, dep: packageView(o).dep, seatsCode: o.seats, seats: t('th_seats') + ': ' + t('seats_' + o.seats), availCode: o.avail, avail: t('avail_' + o.avail),
+            price: money(shown(o.price)), perPerson: children() ? t('group_total') : t('per_person', { p: money(Math.round(shown(o.price) / state.adults)) }),
+            canBook: bookable(o), added: inOffer(o.key), tour: o.tour || ''
+          }))
+        };
+      }).sort((a, b) => a.cheapest - b.cheapest);
+    })();
 
     // "Batafsil" oynasi: tanlangan mehmonxona, uning tafsilotlari va barcha operatorlarning takliflari
     let detail = null;
@@ -880,10 +953,11 @@
 
     return {
       my, dests, multi, destChips, allDestsOn: dests.length === my.length,
-      regions, hot, days, ops, cityChecks, capMin, capMax, cap, active, hotels, tours, tourTotal: allTours.length, detail,
+      regions, hot, days, ops, cityChecks, capMin, capMax, cap, active, hotels, tours, tourTotal: allTours.length, board, detail,
       // "Chipta narxi ko'rsatilgan" filtri — faqat natijalarda chipta narxi bor takliflar bo'lsa (operatorlar odatda bermaydi)
       hasTickets: rows.some(r => r.offers.some(o => o.ticket && o.ticket.price > 0)),
-      resultsTitle: (multi ? t('countries_n', { n: dests.length }) : destNames[0]) + ': ' + (state.groupBy === 'tour'
+      resultsTitle: (multi ? t('countries_n', { n: dests.length }) : destNames[0])
+        + (activeCity() ? ', ' + (activeCity()[state.lang] || activeCity().en) : '') + ': ' + (state.groupBy === 'tour'
         ? t(isHotels() ? 'variants_n' : 'tours_n', { n: allTours.length }) + ' · ' + t('hotels_n', { n: hotels.length })
         : t('hotels_n', { n: hotels.length })),
       summary,
@@ -990,6 +1064,24 @@
     </div>`;
   }
 
+  // Shahar (kurort): tanlangan davlat(lar)ning shaharlari; bir nechta davlat bo'lsa — davlat bo'yicha guruhlangan
+  function viewCityField(vm) {
+    const groups = vm.dests.map(id => ({ id, list: CITY_LIST.filter(c => c.country === id) })).filter(g => g.list.length);
+    if (!groups.length) return '';
+    const cur = activeCity() ? activeCity().id : '';
+    const opt = (c) => `<option value="${esc(c.id)}"${c.id === cur ? ' selected' : ''}>${esc(c[state.lang] || c.en)}</option>`;
+    return `
+    <div class="field f-city">
+      <label for="f-city" class="label">${esc(t('f_search_city'))}</label>
+      <select id="f-city" class="input" data-change="searchCity">
+        <option value=""${cur ? '' : ' selected'}>${esc(t('all_cities'))}</option>
+        ${groups.length > 1
+          ? groups.map(g => `<optgroup label="${esc(countryName(g.id))}">${g.list.map(opt).join('')}</optgroup>`).join('')
+          : groups[0].list.map(opt).join('')}
+      </select>
+    </div>`;
+  }
+
   function viewSearch(vm) {
     const hOnly = isHotels();
     const fromField = hOnly ? '' : `
@@ -1021,11 +1113,14 @@
   ${state.settings ? viewSettings(vm) : ''}
   <div class="fields">
     ${fromField}
+    ${hOnly ? '' : viewCityField(vm)}
     ${dateButton('f-date', 'date', state.date, t(hOnly ? 'f_checkin' : 'f_date'))}
+    ${dateButton('f-tret', 'tRet', dt.addDays(state.date, state.nights), t(hOnly ? 'f_checkout' : 'f_ret_tour'))}
     <div class="field f-nights">
       <label for="f-nights" class="label">${esc(t('f_nights'))}</label>
       <select id="f-nights" class="input" data-change="nights">
-        ${NIGHTS.map(n => `<option value="${n}"${n === state.nights ? ' selected' : ''}>${esc(t('nights_n', { n }))}</option>`).join('')}
+        ${NIGHTS.concat(NIGHTS.indexOf(state.nights) < 0 ? [state.nights] : []).sort((a, b) => a - b)
+          .map(n => `<option value="${n}"${n === state.nights ? ' selected' : ''}>${esc(t('nights_n', { n }))}</option>`).join('')}
       </select>
     </div>
     ${viewGuests()}
@@ -1432,6 +1527,47 @@
   </div>
 </article>`;
   }
+  // "Operatorlar bo'yicha" taxta: har operator — ustun (sarlavhada paketlar soni va eng arzoni), ichida paketlar
+  // eng arzonidan qimmatiga, xuddi operator saytidagi jadval kabi. Ustun ichida aylantiriladi; ko'p bo'lsa — "Yana" / "Hammasi".
+  function viewBoard(cols) {
+    if (!cols.length) return '';
+    const card = (r) => `
+      <li class="bcard${r.canBook ? '' : ' stopped'}" data-key="${esc(r.key)}">
+        <div class="bcard-top">
+          <button type="button" class="h-link bcard-name" data-action="detail" data-arg="${esc(r.key)}">${esc(r.name)}</button>
+          <span class="bcard-price">${esc(r.price)}</span>
+        </div>
+        <div class="bcard-sub"><span class="stars" aria-label="${esc(t('stars_aria', { n: r.stars }))}">${'★'.repeat(r.stars)}</span> ${esc(r.place)}<span class="bcard-pp">${esc(r.perPerson)}</span></div>
+        <div class="bcard-meta"><b title="${esc(r.mealLong)}">${esc(r.meal)}</b> · ${esc(r.room)}</div>
+        ${r.dep ? `<div class="bcard-dep">✈ ${esc(r.dep)}</div>` : ''}
+        <div class="bcard-foot">
+          ${r.gds ? `<span class="pill pk-gds" title="${esc(t('gds_hint'))}">GDS</span>` : ''}
+          <span class="pill av-${esc(r.availCode)}">${esc(r.avail)}</span>
+          ${isHotels() ? '' : `<span class="pill${r.seatsCode === 'few' ? ' av-few' : ''}">${esc(r.seats)}</span>`}
+          <button type="button" class="btn btn-sm btn-add btn-add-sm" data-action="add" data-arg="${esc(r.key)}" aria-pressed="${r.added}"${r.canBook ? '' : ' disabled'}>${esc(r.added ? t('in_offer') : t('add_sm'))}</button>
+        </div>
+      </li>`;
+    return `
+  <div class="board" role="region" aria-label="${esc(t('group_op'))}" tabindex="0" data-key="board">
+    ${cols.map(c => `
+    <section class="bcol" data-key="col-${esc(c.id)}" aria-label="${esc(c.name)}">
+      <header class="bcol-head" style="--op:${c.color}">
+        <div class="bcol-title"><span class="dot" style="background:${c.color}" aria-hidden="true"></span><b>${esc(c.name)}</b>
+          ${c.site ? `<a class="op-site sm" href="${esc(c.site)}" target="_blank" rel="noopener noreferrer" title="${esc(t('op_site', { op: c.name }))}" aria-label="${esc(t('op_site', { op: c.name }))}">${I.ext}</a>` : ''}</div>
+        <div class="bcol-sum">${esc(t('board_count', { n: c.count + (c.opMore ? '+' : ''), p: c.from }))}</div>
+      </header>
+      <ol class="bcol-list">${c.rows.map(card).join('')}</ol>
+      ${c.more ? `<div class="bcol-more">
+        <button type="button" class="btn btn-sm" data-action="opMore" data-arg="${esc(c.id)}">${esc(t('board_more', { n: Math.min(BOARD_PAGE, c.more) }))}</button>
+        <button type="button" class="btn-link" data-action="opMore" data-arg="${esc(c.id)}:all">${esc(t('board_all', { n: c.count }))}</button>
+      </div>` : c.opMore || c.opLoading ? `<div class="bcol-more">
+        <button type="button" class="btn btn-sm" data-action="opLoad" data-arg="${esc(c.id)}"${c.opLoading ? ' disabled aria-busy="true"' : ''}>${esc(c.opLoading ? t('board_loading') : t('board_load'))}</button>
+        ${c.opFailed ? `<span class="bcol-err" role="status">${esc(t('board_load_err'))}</span>` : `<span class="bcol-hint">${esc(t('board_load_hint'))}</span>`}
+      </div>` : ''}
+    </section>`).join('')}
+  </div>`;
+  }
+
   // "Shu mehmonxonadagi turlar": barcha operatorlar faqat shu mehmonxonani qidiradi (allaqachon shu mehmonxona bo'lsa — ko'rinmaydi)
   function viewFocusBtn(name) {
     if (isHotels() || !name || (state.hotelFocus && hotelNameMatch(name, state.hotelFocus))) return '';
@@ -1538,7 +1674,7 @@
       <p>${esc(vm.summary)}</p>
     </div>
     <div class="seg-group">
-      <div class="seg seg-view" role="group" aria-label="${esc(t('group_label'))}">${seg('group', [{ id: 'tour', label: t(isHotels() ? 'group_tour_h' : 'group_tour') }, { id: 'hotel', label: t('group_hotel') }], state.groupBy)}</div>
+      <div class="seg seg-view" role="group" aria-label="${esc(t('group_label'))}">${seg('group', [{ id: 'op', label: t('group_op') }, { id: 'tour', label: t(isHotels() ? 'group_tour_h' : 'group_tour') }, { id: 'hotel', label: t('group_hotel') }], state.groupBy)}</div>
       <div class="seg" role="group" aria-label="${esc(t('sort_label'))}">${seg('sort', [{ id: 'price', label: t('sort_price') }, { id: 'rating', label: t('sort_rating') }, { id: 'stars', label: t('sort_stars') }], state.sort)}</div>
       <div class="seg" role="group" aria-label="${esc(t('price_type'))}">${seg('mode', [{ id: 'net', label: t('mode_net') }, { id: 'client', label: t('mode_client', { m: mPct() }) }], state.mode)}</div>
     </div>
@@ -1546,7 +1682,7 @@
   ${vm.live ? `
   <p class="live-note${vm.live.loading ? ' loading' : ''}" data-key="live-note" role="status">
     <span class="live-dot" aria-hidden="true"></span>
-    ${esc(vm.live.loading ? t('live_loading') : vm.live.failed && !vm.live.done ? t('live_failed') : t('live_note', { n: vm.live.ops }))}
+    ${esc(vm.live.loading ? t('live_loading') : vm.live.failed && !vm.live.done ? t('live_failed') : vm.live.time ? t('live_note_t', { n: vm.live.ops, time: vm.live.time }) : t('live_note', { n: vm.live.ops }))}
   </p>` : `<p class="demo-note">${esc(t(isHotels() ? 'demo_note_h' : 'demo_note'))}</p>`}
   ${state.hotelFocus && !isHotels() ? `
   <div class="focus-note" data-key="focus-note">
@@ -1554,7 +1690,7 @@
     <button type="button" class="btn btn-sm" data-action="hotelFocusClear">${esc(t('hotel_focus_clear'))}</button>
   </div>` : ''}
   ${viewGate()}
-  ${state.groupBy === 'tour' ? vm.tours.map(viewTour).join('') + (vm.tourTotal > vm.tours.length ? `
+  ${state.groupBy === 'op' ? viewBoard(vm.board) : state.groupBy === 'tour' ? vm.tours.map(viewTour).join('') + (vm.tourTotal > vm.tours.length ? `
   <div class="more-row" data-key="more">
     <span class="small muted">${esc(t('shown_of', { a: vm.tours.length, b: vm.tourTotal }))}</span>
     <button type="button" class="btn" data-action="moreTours">${esc(t('show_more', { n: Math.min(TOUR_PAGE, vm.tourTotal - vm.tours.length) }))}</button>
@@ -1841,6 +1977,28 @@
     },
     // Aylanma sana tanlagich (js/wheel.js). Bron qilingan kunlar qizil va tanlab bo'lmaydi.
     pickDate: (field) => {
+      // Tur/mehmonxona qaytish (chiqish) sanasi: uchishdan 1–30 kecha keyin; tanlansa — tunlar soni shundan
+      if (field === 'tRet') {
+        window.WheelPicker.open({
+          value: dt.addDays(state.date, state.nights),
+          min: dt.addDays(state.date, 1), max: dt.addDays(state.date, 30),
+          booked: bookedDays(),
+          months: L.CAL[state.lang].months, wd: L.CAL[state.lang].wd,
+          fmt: fmtLong,
+          labels: {
+            title: t(isHotels() ? 'f_checkout' : 'f_ret_tour'),
+            day: t('wp_day'), month: t('wp_month'), year: t('wp_year'),
+            done: t('wp_done'), cancel: t('wp_cancel'), today: t('wp_today'), booked: t('wp_booked'),
+            bookedN: (n) => t('wp_booked_n', { n }), skipped: (d) => t('wp_skipped', { d })
+          },
+          returnFocus: document.getElementById('f-tret'),
+          onPick: (iso) => {
+            const n = daysBetween(state.date, iso);
+            if (n >= 1 && n <= 30 && n !== state.nights) setState({ nights: n, maxPrice: null, open: {} });
+          }
+        });
+        return;
+      }
       const isRet = field === 'fRet';
       const min = isRet ? dt.addDays(state.date, 1) : today;
       window.WheelPicker.open({
@@ -1890,7 +2048,36 @@
     sort: (id) => setState({ sort: id }),
     mode: (id) => setState({ mode: id }),
     open: (hid) => setState({ open: Object.assign({}, state.open, { [hid]: !state.open[hid] }) }),
-    group: (id) => setState({ groupBy: id === 'hotel' ? 'hotel' : 'tour' }),
+    group: (id) => setState({ groupBy: id === 'hotel' ? 'hotel' : id === 'op' ? 'op' : 'tour', opLimit: {} }),
+    // Taxta: operator ustunida yana BOARD_PAGE ta paket (yoki hammasi)
+    opMore: (arg) => {
+      const [id, all] = String(arg).split(':');
+      const cur = state.opLimit[id] || BOARD_PAGE;
+      setState({ opLimit: Object.assign({}, state.opLimit, { [id]: all === 'all' ? 100000 : cur + BOARD_PAGE }) });
+    },
+    // Taxta: operator saytidan keyingi sahifalar (narx bo'yicha davomi) — tanlangan kun, har bir davlat bo'yicha
+    opLoad: (id) => {
+      if (opLoading[id]) return;
+      const q = query();
+      const jobs = destList().map(c => {
+        const e = D.live.entry(c, q, state.date);
+        const st = e && e.ops.find(x => x.id === id);
+        if (!st || !st.more || !(st.next > 1)) return null;
+        const params = new URLSearchParams({ country: c, date: state.date, window: 0, nights: q.nights, adults: q.adults, children: q.childAges.join(','), from: q.from, op: id, page: st.next });
+        if (q.hotel) params.set('hotel', q.hotel);
+        if (q.city && (cityById(q.city) || {}).country === c) params.set('city', q.city);
+        const day = state.date;
+        return sync.request('/api/live/tours?' + params, {}, 90000).then(data => {
+          D.live.set(c, q, day, { operators: data.operators, offers: (data.offers || []).filter(o => o.checkIn === day) }, true);
+        });
+      }).filter(Boolean);
+      if (!jobs.length) return;
+      opLoading[id] = true;
+      // Yangi kelganlari ham ko'rinsin: ustundagi hamma paket ochiladi
+      state.opLimit = Object.assign({}, state.opLimit, { [id]: 100000 });
+      render();
+      Promise.all(jobs.map(j => j.catch(() => { opLoadFailed[id] = Date.now(); }))).then(() => { delete opLoading[id]; render(); });
+    },
     moreTours: () => setState({ tourLimit: state.tourLimit + TOUR_PAGE }),
     // "Batafsil": taklif kaliti bo'yicha mehmonxona topiladi; oyna yopilganda fokus shu tugmaga qaytadi
     detail: (key) => {
@@ -1989,6 +2176,13 @@
   const changes = {
     from: (el) => setState({ from: el.value, maxPrice: null, open: {} }),
     nights: (el) => setState({ nights: +el.value, maxPrice: null, open: {} }),
+    // Qidiruvdagi shahar: tanlangan shahar davlati qidiruvda bo'lmasa — shu davlat tanlanadi
+    searchCity: (el) => {
+      const c = cityById(el.value);
+      const patch = { city: c ? c.id : '', maxPrice: null, open: {}, opLimit: {} };
+      if (c && destList().indexOf(c.country) < 0) patch.dests = [c.country];
+      setState(patch);
+    },
     fTo: (el) => setState({ fTo: el.value }),
     fAir: (el) => setState({ fAir: Object.assign({}, state.fAir, { [el.dataset.arg]: el.checked }) }),
     fDirect: (el) => setState({ fDirect: el.checked }),
